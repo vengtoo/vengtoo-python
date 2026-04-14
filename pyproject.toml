@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "authzx"
+version = "0.1.0"
+description = "AuthzX Python SDK — authorization client for AuthzX cloud and local agent"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+keywords = ["authorization", "authzx", "opa", "rbac", "abac"]
+dependencies = ["httpx>=0.25.0"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "respx"]
+
+[tool.setuptools.packages.find]
+include = ["authzx*"]
