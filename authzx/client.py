@@ -1,19 +1,31 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 from typing import Any
 
 import httpx
 
-from authzx.errors import AuthzXError
+from authzx.errors import AuthzXError, AuthzXOAuthError
 from authzx.types import AuthorizeRequest, AuthorizeResponse, Resource, Subject
+
+
+DEFAULT_TOKEN_URL = "https://api.authzx.com/identity-srv/v1/oauth/token"
+REFRESH_SKEW_SECONDS = 60.0
 
 
 class AuthzX:
     """AuthzX authorization client.
 
-    For cloud:  AuthzX(api_key="azx_...")
-    For agent:  AuthzX(base_url="http://localhost:8181")
+    For cloud with API key:
+        AuthzX(api_key="azx_...")
+
+    For cloud with OAuth2 Client Credentials:
+        AuthzX(client_id="...", client_secret="azx_cs_...")
+
+    For local agent:
+        AuthzX(base_url="http://localhost:8181")
     """
 
     def __init__(
@@ -22,6 +34,9 @@ class AuthzX:
         base_url: str = "https://api.authzx.com/v1",
         timeout: float = 10.0,
         max_retries: int = 2,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+        token_url: str = DEFAULT_TOKEN_URL,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -29,6 +44,33 @@ class AuthzX:
         self.max_retries = max_retries
         self._client = httpx.Client(timeout=timeout)
         self._async_client: httpx.AsyncClient | None = None
+
+        # OAuth configuration + token cache.
+        oauth_provided = bool(client_id or client_secret)
+        if oauth_provided:
+            if not client_id or not client_secret:
+                raise ValueError(
+                    "AuthzX: both client_id and client_secret are required for OAuth"
+                )
+            self._oauth = {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "token_url": token_url,
+            }
+        else:
+            self._oauth = None
+
+        if self.api_key and self._oauth is not None:
+            raise ValueError(
+                "AuthzX: configure either api_key or OAuth client credentials, not both"
+            )
+
+        self._cached_token: str | None = None
+        self._token_expires_at: float = 0.0
+        # Separate locks for sync and async paths — they protect the same
+        # cache but are never held across sync/async boundaries.
+        self._token_lock = threading.Lock()
+        self._async_token_lock: asyncio.Lock | None = None
 
     def close(self) -> None:
         self._client.close()
@@ -46,10 +88,129 @@ class AuthzX:
             return f"{self.base_url}/authorize"
         return f"{self.base_url}/v1/authorize"
 
-    def _headers(self) -> dict[str, str]:
-        h: dict[str, str] = {"Content-Type": "application/json"}
+    # --- Auth header resolution ---
+
+    def _static_auth_header(self) -> dict[str, str]:
+        """Headers for API-key mode (or empty dict for local-agent mode)."""
         if self.api_key:
-            h["Authorization"] = f"Bearer {self.api_key}"
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
+
+    def _token_is_fresh(self) -> bool:
+        return (
+            self._cached_token is not None
+            and time.time() < self._token_expires_at - REFRESH_SKEW_SECONDS
+        )
+
+    def _invalidate_token(self) -> None:
+        self._cached_token = None
+        self._token_expires_at = 0.0
+
+    def _parse_token_response(self, resp: httpx.Response) -> str:
+        text = resp.text
+        if resp.status_code == 200:
+            try:
+                payload = resp.json()
+            except Exception as e:  # noqa: BLE001
+                raise AuthzXOAuthError(
+                    resp.status_code,
+                    "invalid_response",
+                    f"token endpoint returned non-JSON body: {e}",
+                )
+            access_token = payload.get("access_token")
+            if not access_token:
+                raise AuthzXOAuthError(
+                    resp.status_code,
+                    "invalid_response",
+                    "token endpoint returned empty access_token",
+                )
+            ttl = float(payload.get("expires_in") or 3600)
+            self._cached_token = access_token
+            self._token_expires_at = time.time() + ttl
+            return access_token
+
+        # Error path — try to decode RFC 6749 body.
+        code = "token_endpoint_error"
+        description = text
+        try:
+            parsed = resp.json()
+            if isinstance(parsed, dict):
+                code = str(parsed.get("error") or code)
+                if parsed.get("error_description"):
+                    description = str(parsed["error_description"])
+        except Exception:  # noqa: BLE001
+            pass
+        if resp.status_code == 401 and code == "token_endpoint_error":
+            code = "invalid_client"
+        raise AuthzXOAuthError(resp.status_code, code, description)
+
+    def _fetch_token_sync(self) -> str:
+        assert self._oauth is not None
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": self._oauth["client_id"],
+            "client_secret": self._oauth["client_secret"],
+        }
+        try:
+            resp = self._client.post(
+                self._oauth["token_url"],
+                data=data,
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as e:
+            raise AuthzXOAuthError(
+                0, "network_error", f"OAuth token request failed: {e}"
+            )
+        return self._parse_token_response(resp)
+
+    def _get_access_token_sync(self) -> str:
+        with self._token_lock:
+            if self._token_is_fresh():
+                return self._cached_token  # type: ignore[return-value]
+            return self._fetch_token_sync()
+
+    def _headers_sync(self) -> dict[str, str]:
+        h: dict[str, str] = {"Content-Type": "application/json"}
+        if self._oauth is not None:
+            h["Authorization"] = f"Bearer {self._get_access_token_sync()}"
+        else:
+            h.update(self._static_auth_header())
+        return h
+
+    async def _fetch_token_async(self) -> str:
+        assert self._oauth is not None
+        client = self._get_async_client()
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": self._oauth["client_id"],
+            "client_secret": self._oauth["client_secret"],
+        }
+        try:
+            resp = await client.post(
+                self._oauth["token_url"],
+                data=data,
+                headers={"Accept": "application/json"},
+            )
+        except httpx.HTTPError as e:
+            raise AuthzXOAuthError(
+                0, "network_error", f"OAuth token request failed: {e}"
+            )
+        return self._parse_token_response(resp)
+
+    async def _get_access_token_async(self) -> str:
+        if self._async_token_lock is None:
+            self._async_token_lock = asyncio.Lock()
+        async with self._async_token_lock:
+            if self._token_is_fresh():
+                return self._cached_token  # type: ignore[return-value]
+            return await self._fetch_token_async()
+
+    async def _headers_async(self) -> dict[str, str]:
+        h: dict[str, str] = {"Content-Type": "application/json"}
+        if self._oauth is not None:
+            h["Authorization"] = f"Bearer {await self._get_access_token_async()}"
+        else:
+            h.update(self._static_auth_header())
         return h
 
     def _parse_response(self, data: dict[str, Any]) -> AuthorizeResponse:
@@ -60,36 +221,50 @@ class AuthzX:
             access_path=data.get("access_path"),
         )
 
-    def _handle_response(self, resp: httpx.Response) -> AuthorizeResponse:
-        if resp.status_code == 200:
-            return self._parse_response(resp.json())
-        raise AuthzXError(resp.status_code, resp.text)
-
     def _is_retryable(self, status_code: int) -> bool:
         return status_code >= 500 or status_code == 429
 
     # --- Sync ---
 
     def authorize(self, req: AuthorizeRequest) -> AuthorizeResponse:
+        # OAuth flow gets exactly one 401-triggered refresh+retry across the
+        # whole authorize() call, independent of max_retries.
+        oauth_retried = False
         last_err: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        attempt = 0
+        while attempt <= self.max_retries:
             if attempt > 0:
                 time.sleep(attempt * 0.1)
             try:
-                resp = self._client.post(self._url(), headers=self._headers(), json=req.to_dict())
+                resp = self._client.post(
+                    self._url(), headers=self._headers_sync(), json=req.to_dict()
+                )
                 if resp.status_code == 200:
                     return self._parse_response(resp.json())
+                if (
+                    resp.status_code == 401
+                    and self._oauth is not None
+                    and not oauth_retried
+                ):
+                    self._invalidate_token()
+                    oauth_retried = True
+                    # do not count this against max_retries
+                    continue
                 err = AuthzXError(resp.status_code, resp.text)
                 if self._is_retryable(resp.status_code):
                     last_err = err
+                    attempt += 1
                     continue
                 raise err
-            except AuthzXError:
+            except (AuthzXError, AuthzXOAuthError):
                 raise
             except Exception as e:
                 last_err = e
+                attempt += 1
                 continue
-        raise last_err  # type: ignore[misc]
+            attempt += 1
+        assert last_err is not None
+        raise last_err
 
     def check(
         self,
@@ -110,26 +285,41 @@ class AuthzX:
 
     async def async_authorize(self, req: AuthorizeRequest) -> AuthorizeResponse:
         client = self._get_async_client()
+        oauth_retried = False
         last_err: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        attempt = 0
+        while attempt <= self.max_retries:
             if attempt > 0:
-                import asyncio
                 await asyncio.sleep(attempt * 0.1)
             try:
-                resp = await client.post(self._url(), headers=self._headers(), json=req.to_dict())
+                resp = await client.post(
+                    self._url(), headers=await self._headers_async(), json=req.to_dict()
+                )
                 if resp.status_code == 200:
                     return self._parse_response(resp.json())
+                if (
+                    resp.status_code == 401
+                    and self._oauth is not None
+                    and not oauth_retried
+                ):
+                    self._invalidate_token()
+                    oauth_retried = True
+                    continue
                 err = AuthzXError(resp.status_code, resp.text)
                 if self._is_retryable(resp.status_code):
                     last_err = err
+                    attempt += 1
                     continue
                 raise err
-            except AuthzXError:
+            except (AuthzXError, AuthzXOAuthError):
                 raise
             except Exception as e:
                 last_err = e
+                attempt += 1
                 continue
-        raise last_err  # type: ignore[misc]
+            attempt += 1
+        assert last_err is not None
+        raise last_err
 
     async def async_check(
         self,

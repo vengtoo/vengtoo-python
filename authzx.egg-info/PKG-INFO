@@ -1,3 +1,19 @@
+Metadata-Version: 2.4
+Name: authzx
+Version: 0.1.0
+Summary: AuthzX Python SDK — authorization client for AuthzX cloud and local agent
+License: MIT
+Keywords: authorization,authzx,opa,rbac,abac
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: httpx>=0.25.0
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-asyncio; extra == "dev"
+Requires-Dist: respx; extra == "dev"
+Dynamic: license-file
+
 # AuthzX Python SDK
 
 Python client for [AuthzX](https://authzx.com) — works with both AuthzX Cloud and the local AuthzX Agent.
@@ -25,28 +41,6 @@ allowed = client.check(
     resource=Resource(type="document", id="doc:456"),
 )
 ```
-
-### OAuth2 Client Credentials
-
-For service-to-service auth, pass `client_id` and `client_secret` (secret is prefixed `azx_cs_`). The SDK exchanges credentials at the token endpoint, caches the JWT in memory, and refreshes ~60s before expiry. Both sync and async calls share the same cache.
-
-```python
-client = AuthzX(
-    client_id="my-client-id",
-    client_secret="azx_cs_...",
-)
-```
-
-Equivalent curl for the underlying token exchange:
-
-```bash
-curl -X POST https://api.authzx.com/identity-srv/v1/oauth/token \
-  -d grant_type=client_credentials \
-  -d client_id=my-client-id \
-  -d client_secret=azx_cs_...
-```
-
-Providing both `api_key` and OAuth credentials is rejected at construction. A bad `client_id` / `client_secret` surfaces as `AuthzXOAuthError` (distinct from `AuthzXError`) with a message pointing you at the OAuth exchange.
 
 ### Agent Mode (local)
 

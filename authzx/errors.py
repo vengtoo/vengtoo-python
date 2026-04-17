@@ -21,3 +21,29 @@ class AuthzXError(Exception):
     @property
     def is_server_error(self) -> bool:
         return self.status_code >= 500
+
+
+class AuthzXOAuthError(Exception):
+    """Raised when the OAuth2 Client Credentials token exchange fails.
+
+    Distinct from ``AuthzXError`` (which wraps API-call failures) so
+    customers debugging setup know the failure was the OAuth exchange, not
+    their ``authorize()`` call.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        description: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self.code = code
+        self.description = description
+        if code == "invalid_client":
+            msg = "OAuth authentication failed: check client_id/client_secret"
+        elif description:
+            msg = f"OAuth token exchange failed ({code}): {description}"
+        else:
+            msg = f"OAuth token exchange failed ({code})"
+        super().__init__(msg)

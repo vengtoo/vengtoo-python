@@ -1,0 +1,14 @@
+LICENSE
+README.md
+pyproject.toml
+authzx/__init__.py
+authzx/client.py
+authzx/errors.py
+authzx/py.typed
+authzx/types.py
+authzx.egg-info/PKG-INFO
+authzx.egg-info/SOURCES.txt
+authzx.egg-info/dependency_links.txt
+authzx.egg-info/requires.txt
+authzx.egg-info/top_level.txt
+tests/test_client.py
