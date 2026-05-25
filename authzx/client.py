@@ -8,7 +8,11 @@ from typing import Any
 import httpx
 
 from authzx.errors import AuthzXError, AuthzXOAuthError
-from authzx.types import AuthorizeRequest, AuthorizeResponse, Resource, Subject
+from authzx.types import (
+    Action, AuthorizeContext, AuthorizeRequest, AuthorizeResponse,
+    BatchEvalItem, BatchEvaluationRequest, BatchEvaluationResponse,
+    Resource, Subject,
+)
 
 
 DEFAULT_TOKEN_URL = "https://api.authzx.com/identity-srv/v1/oauth/token"
@@ -75,18 +79,43 @@ class AuthzX:
     def close(self) -> None:
         self._client.close()
         if self._async_client:
-            # async client should be closed with async_close()
-            pass
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop and loop.is_running():
+                loop.create_task(self._async_client.aclose())
+            else:
+                asyncio.run(self._async_client.aclose())
+            self._async_client = None
 
     async def async_close(self) -> None:
         if self._async_client:
             await self._async_client.aclose()
             self._async_client = None
 
+    def __enter__(self) -> AuthzX:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    async def __aenter__(self) -> AuthzX:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.async_close()
+
     def _url(self) -> str:
         if self.base_url.endswith("/v1"):
             return f"{self.base_url}/authorize"
         return f"{self.base_url}/v1/authorize"
+
+    def _batch_url(self) -> str:
+        if self.base_url.endswith("/v1"):
+            base = self.base_url[:-3]
+            return f"{base}/access/v1/evaluations"
+        return f"{self.base_url}/access/v1/evaluations"
 
     # --- Auth header resolution ---
 
@@ -214,11 +243,18 @@ class AuthzX:
         return h
 
     def _parse_response(self, data: dict[str, Any]) -> AuthorizeResponse:
+        ctx_data = data.get("context")
+        ctx = None
+        if ctx_data and isinstance(ctx_data, dict):
+            ctx = AuthorizeContext(
+                reason=ctx_data.get("reason"),
+                reason_code=ctx_data.get("reason_code"),
+                policy_id=ctx_data.get("policy_id"),
+                access_path=ctx_data.get("access_path"),
+            )
         return AuthorizeResponse(
-            allowed=data["allowed"],
-            reason=data.get("reason", ""),
-            policy_id=data.get("policy_id"),
-            access_path=data.get("access_path"),
+            decision=data["decision"],
+            context=ctx,
         )
 
     def _is_retryable(self, status_code: int) -> bool:
@@ -273,8 +309,56 @@ class AuthzX:
         resource: Resource,
         context: dict[str, Any] | None = None,
     ) -> bool:
-        resp = self.authorize(AuthorizeRequest(subject=subject, resource=resource, action=action, context=context))
-        return resp.allowed
+        resp = self.authorize(AuthorizeRequest(subject=subject, resource=resource, action=Action(name=action), context=context))
+        return resp.decision
+
+    def authorize_batch(self, req: BatchEvaluationRequest) -> BatchEvaluationResponse:
+        if not req.evaluations:
+            raise ValueError("batch request requires at least one evaluation")
+        if len(req.evaluations) > 50:
+            raise ValueError("batch request exceeds maximum of 50 evaluations")
+        oauth_retried = False
+        last_err: Exception | None = None
+        attempt = 0
+        while attempt <= self.max_retries:
+            if attempt > 0:
+                time.sleep(attempt * 0.1)
+            try:
+                resp = self._client.post(
+                    self._batch_url(), headers=self._headers_sync(), json=req.to_dict()
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return BatchEvaluationResponse(
+                        evaluations=[self._parse_response(e) for e in data["evaluations"]],
+                    )
+                if (
+                    resp.status_code == 401
+                    and self._oauth is not None
+                    and not oauth_retried
+                ):
+                    self._invalidate_token()
+                    oauth_retried = True
+                    continue
+                err = AuthzXError(resp.status_code, resp.text)
+                if self._is_retryable(resp.status_code):
+                    last_err = err
+                    attempt += 1
+                    continue
+                raise err
+            except (AuthzXError, AuthzXOAuthError):
+                raise
+            except Exception as e:
+                last_err = e
+                attempt += 1
+                continue
+            attempt += 1
+        assert last_err is not None
+        raise last_err
+
+    def check_batch(self, req: BatchEvaluationRequest) -> list[bool]:
+        resp = self.authorize_batch(req)
+        return [e.decision for e in resp.evaluations]
 
     # --- Async ---
 
@@ -328,8 +412,57 @@ class AuthzX:
         resource: Resource,
         context: dict[str, Any] | None = None,
     ) -> bool:
-        resp = await self.async_authorize(AuthorizeRequest(subject=subject, resource=resource, action=action, context=context))
-        return resp.allowed
+        resp = await self.async_authorize(AuthorizeRequest(subject=subject, resource=resource, action=Action(name=action), context=context))
+        return resp.decision
+
+    async def async_authorize_batch(self, req: BatchEvaluationRequest) -> BatchEvaluationResponse:
+        if not req.evaluations:
+            raise ValueError("batch request requires at least one evaluation")
+        if len(req.evaluations) > 50:
+            raise ValueError("batch request exceeds maximum of 50 evaluations")
+        client = self._get_async_client()
+        oauth_retried = False
+        last_err: Exception | None = None
+        attempt = 0
+        while attempt <= self.max_retries:
+            if attempt > 0:
+                await asyncio.sleep(attempt * 0.1)
+            try:
+                resp = await client.post(
+                    self._batch_url(), headers=await self._headers_async(), json=req.to_dict()
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return BatchEvaluationResponse(
+                        evaluations=[self._parse_response(e) for e in data["evaluations"]],
+                    )
+                if (
+                    resp.status_code == 401
+                    and self._oauth is not None
+                    and not oauth_retried
+                ):
+                    self._invalidate_token()
+                    oauth_retried = True
+                    continue
+                err = AuthzXError(resp.status_code, resp.text)
+                if self._is_retryable(resp.status_code):
+                    last_err = err
+                    attempt += 1
+                    continue
+                raise err
+            except (AuthzXError, AuthzXOAuthError):
+                raise
+            except Exception as e:
+                last_err = e
+                attempt += 1
+                continue
+            attempt += 1
+        assert last_err is not None
+        raise last_err
+
+    async def async_check_batch(self, req: BatchEvaluationRequest) -> list[bool]:
+        resp = await self.async_authorize_batch(req)
+        return [e.decision for e in resp.evaluations]
 
     # --- FastAPI ---
 

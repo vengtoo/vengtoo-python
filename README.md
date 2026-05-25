@@ -1,6 +1,6 @@
 # AuthzX Python SDK
 
-Python client for [AuthzX](https://authzx.com) — works with both AuthzX Cloud and the local AuthzX Agent.
+Python client for [AuthzX](https://authzx.com) — works with both AuthzX Cloud and the AuthzX Agent.
 
 Supports sync and async. Requires Python 3.9+.
 
@@ -57,15 +57,15 @@ client = AuthzX(base_url="http://localhost:8181")
 ### Full Evaluate Response
 
 ```python
-from authzx import AuthorizeRequest
+from authzx import AuthorizeRequest, Action
 
 resp = client.authorize(AuthorizeRequest(
     subject=Subject(id="user:123", type="user"),
     resource=Resource(type="document", id="doc:456"),
-    action="read",
+    action=Action(name="read"),
     context={"ip": "10.0.0.1"},
 ))
-# resp.allowed, resp.reason, resp.policy_id, resp.access_path
+# resp.decision, resp.context.reason, resp.context.policy_id, resp.context.access_path
 ```
 
 ### Async
@@ -113,7 +113,9 @@ AuthzX(
 
 | Type | Fields |
 |------|--------|
-| `Subject` | `id`, `type`, `attributes`, `roles` |
-| `Resource` | `type`, `id`, `attributes` |
+| `Subject` | `id`, `type`, `attributes`, `properties`, `roles` |
+| `Resource` | `id`, `type`, `attributes`, `properties` |
+| `Action` | `name`, `properties` |
 | `AuthorizeRequest` | `subject`, `resource`, `action`, `context` |
-| `AuthorizeResponse` | `allowed`, `reason`, `policy_id`, `access_path` |
+| `AuthorizeContext` | `reason`, `reason_code`, `policy_id`, `access_path` |
+| `AuthorizeResponse` | `decision`, `context` |

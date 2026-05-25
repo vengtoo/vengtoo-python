@@ -81,7 +81,7 @@ class _OAuthHandler(BaseHTTPRequestHandler):
         if responder is not None:
             status, body = responder(auth_header)
         else:
-            status, body = 200, {"allowed": True, "reason": "ok"}
+            status, body = 200, {"decision": True, "context": {"reason": "ok"}}
         payload = json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -171,7 +171,7 @@ def test_oauth_401_triggers_refresh_and_retry(oauth_server):
     def responder(auth_header: str):
         if auth_header == "Bearer tok-stale":
             return 401, {"error": "stale"}
-        return 200, {"allowed": True, "reason": "ok"}
+        return 200, {"decision": True, "context": {"reason": "ok"}}
 
     _State.api_responder = responder
 

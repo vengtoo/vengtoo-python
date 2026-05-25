@@ -1,4 +1,4 @@
-from authzx import AuthzX, Subject, Resource, AuthorizeRequest
+from authzx import AuthzX, Subject, Resource, Action, AuthorizeRequest
 
 client = AuthzX(api_key="azx_your_api_key_here")
 
@@ -12,6 +12,8 @@ print("Allowed:", allowed)
 resp = client.authorize(AuthorizeRequest(
     subject=Subject(id="user-123"),
     resource=Resource(id="doc-456"),
-    action="read",
+    action=Action(name="read"),
 ))
-print(f'Allowed={resp.allowed} Reason="{resp.reason}" Path={resp.access_path}')
+reason = resp.context.reason if resp.context else ""
+access_path = resp.context.access_path if resp.context else ""
+print(f'Decision={resp.decision} Reason="{reason}" Path={access_path}')

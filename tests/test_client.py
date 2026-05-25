@@ -4,11 +4,11 @@ import threading
 
 import pytest
 
-from authzx import AuthzX, Subject, Resource, AuthorizeRequest, AuthzXError
+from authzx import AuthzX, Subject, Resource, Action, AuthorizeRequest, AuthzXError
 
 
 class MockHandler(BaseHTTPRequestHandler):
-    response_data = {"allowed": True, "reason": "ok"}
+    response_data = {"decision": True, "context": {"reason": "ok"}}
     status_code = 200
     call_count = 0
 
@@ -30,7 +30,7 @@ class MockHandler(BaseHTTPRequestHandler):
 def mock_server():
     MockHandler.call_count = 0
     MockHandler.status_code = 200
-    MockHandler.response_data = {"allowed": True, "reason": "ok"}
+    MockHandler.response_data = {"decision": True, "context": {"reason": "ok"}}
 
     server = HTTPServer(("127.0.0.1", 0), MockHandler)
     port = server.server_address[1]
@@ -42,7 +42,7 @@ def mock_server():
 
 
 def test_check_allowed(mock_server):
-    MockHandler.response_data = {"allowed": True, "reason": "role_match"}
+    MockHandler.response_data = {"decision": True, "context": {"reason": "role_match"}}
     client = AuthzX(api_key="test-key", base_url=mock_server)
     allowed = client.check(
         subject=Subject(id="user-1"),
@@ -53,7 +53,7 @@ def test_check_allowed(mock_server):
 
 
 def test_check_denied(mock_server):
-    MockHandler.response_data = {"allowed": False, "reason": "no policy"}
+    MockHandler.response_data = {"decision": False, "context": {"reason": "no policy"}}
     client = AuthzX(api_key="test-key", base_url=mock_server)
     allowed = client.check(
         subject=Subject(id="user-1"),
@@ -65,20 +65,23 @@ def test_check_denied(mock_server):
 
 def test_authorize_full_response(mock_server):
     MockHandler.response_data = {
-        "allowed": True,
-        "reason": "direct_access",
-        "policy_id": "pol-123",
-        "access_path": "direct",
+        "decision": True,
+        "context": {
+            "reason": "direct_access",
+            "policy_id": "pol-123",
+            "access_path": "direct",
+        },
     }
     client = AuthzX(api_key="test-key", base_url=mock_server)
     resp = client.authorize(AuthorizeRequest(
         subject=Subject(id="user-1"),
         resource=Resource(id="doc-1"),
-        action="read",
+        action=Action(name="read"),
     ))
-    assert resp.allowed is True
-    assert resp.policy_id == "pol-123"
-    assert resp.access_path == "direct"
+    assert resp.decision is True
+    assert resp.context is not None
+    assert resp.context.policy_id == "pol-123"
+    assert resp.context.access_path == "direct"
 
 
 def test_auth_error(mock_server):
@@ -108,7 +111,7 @@ def test_retry_on_500(mock_server):
             self.end_headers()
             self.wfile.write(body)
             return
-        body = json.dumps({"allowed": True, "reason": "ok"}).encode()
+        body = json.dumps({"decision": True, "context": {"reason": "ok"}}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
