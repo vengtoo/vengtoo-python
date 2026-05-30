@@ -15,7 +15,7 @@ from authzx.types import (
 )
 
 
-DEFAULT_TOKEN_URL = "https://api.authzx.com/identity-srv/v1/oauth/token"
+DEFAULT_TOKEN_URL = "https://api.authzx.com/v1/oauth/token"
 REFRESH_SKEW_SECONDS = 60.0
 
 
@@ -107,14 +107,9 @@ class AuthzX:
         await self.async_close()
 
     def _url(self) -> str:
-        if self.base_url.endswith("/v1"):
-            return f"{self.base_url}/authorize"
-        return f"{self.base_url}/v1/authorize"
+        return f"{self.base_url}/access/v1/evaluation"
 
     def _batch_url(self) -> str:
-        if self.base_url.endswith("/v1"):
-            base = self.base_url[:-3]
-            return f"{base}/access/v1/evaluations"
         return f"{self.base_url}/access/v1/evaluations"
 
     # --- Auth header resolution ---
