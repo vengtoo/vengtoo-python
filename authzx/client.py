@@ -35,7 +35,7 @@ class AuthzX:
     def __init__(
         self,
         api_key: str = "",
-        base_url: str = "https://api.authzx.com/v1",
+        base_url: str = "https://api.authzx.com",
         timeout: float = 10.0,
         max_retries: int = 2,
         client_id: str | None = None,
