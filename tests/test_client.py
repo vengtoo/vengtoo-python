@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from authzx import AuthzX, Subject, Resource, Action, AuthorizeRequest, AuthzXError
+from vengtoo import Vengtoo, Subject, Resource, Action, AuthorizeRequest, VengtooError
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -43,7 +43,7 @@ def mock_server():
 
 def test_check_allowed(mock_server):
     MockHandler.response_data = {"decision": True, "context": {"reason": "role_match"}}
-    client = AuthzX(api_key="test-key", base_url=mock_server)
+    client = Vengtoo(api_key="test-key", base_url=mock_server)
     allowed = client.check(
         subject=Subject(id="user-1"),
         action="read",
@@ -54,7 +54,7 @@ def test_check_allowed(mock_server):
 
 def test_check_denied(mock_server):
     MockHandler.response_data = {"decision": False, "context": {"reason": "no policy"}}
-    client = AuthzX(api_key="test-key", base_url=mock_server)
+    client = Vengtoo(api_key="test-key", base_url=mock_server)
     allowed = client.check(
         subject=Subject(id="user-1"),
         action="delete",
@@ -72,7 +72,7 @@ def test_authorize_full_response(mock_server):
             "access_path": "direct",
         },
     }
-    client = AuthzX(api_key="test-key", base_url=mock_server)
+    client = Vengtoo(api_key="test-key", base_url=mock_server)
     resp = client.authorize(AuthorizeRequest(
         subject=Subject(id="user-1"),
         resource=Resource(id="doc-1"),
@@ -87,8 +87,8 @@ def test_authorize_full_response(mock_server):
 def test_auth_error(mock_server):
     MockHandler.status_code = 401
     MockHandler.response_data = "invalid key"
-    client = AuthzX(api_key="bad-key", base_url=mock_server)
-    with pytest.raises(AuthzXError) as exc_info:
+    client = Vengtoo(api_key="bad-key", base_url=mock_server)
+    with pytest.raises(VengtooError) as exc_info:
         client.check(subject=Subject(id="user-1"), action="read", resource=Resource(id="doc-1"))
     assert exc_info.value.status_code == 401
     assert exc_info.value.is_auth_error
@@ -120,7 +120,7 @@ def test_retry_on_500(mock_server):
 
     MockHandler.do_POST = custom_handler
     try:
-        client = AuthzX(api_key="test-key", base_url=mock_server, max_retries=2)
+        client = Vengtoo(api_key="test-key", base_url=mock_server, max_retries=2)
         allowed = client.check(subject=Subject(id="user-1"), action="read", resource=Resource(id="doc-1"))
         assert allowed is True
         assert call_sequence[0] == 3
@@ -131,8 +131,8 @@ def test_retry_on_500(mock_server):
 def test_no_retry_on_400(mock_server):
     MockHandler.status_code = 400
     MockHandler.call_count = 0
-    client = AuthzX(api_key="test-key", base_url=mock_server)
-    with pytest.raises(AuthzXError) as exc_info:
+    client = Vengtoo(api_key="test-key", base_url=mock_server)
+    with pytest.raises(VengtooError) as exc_info:
         client.check(subject=Subject(id="user-1"), action="read", resource=Resource(id="doc-1"))
     assert exc_info.value.status_code == 400
     assert MockHandler.call_count == 1

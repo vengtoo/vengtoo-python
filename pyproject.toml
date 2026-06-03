@@ -3,24 +3,24 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "authzx"
-version = "1.0.2"
-description = "AuthzX Python SDK — authorization client for AuthzX Cloud and the AuthzX Agent"
+name = "vengtoo"
+version = "1.0.0"
+description = "Vengtoo Python SDK — authorization client for Vengtoo Cloud and the Vengtoo Agent"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
-keywords = ["authorization", "authzx", "rbac", "abac", "access-control", "ai-agents"]
-authors = [{name = "AuthzX", email = "hello@authzx.com"}]
+keywords = ["authorization", "vengtoo", "rbac", "abac", "access-control", "ai-agents"]
+authors = [{name = "Vengtoo", email = "hello@vengtoo.com"}]
 dependencies = ["httpx>=0.25.0"]
 
 [project.urls]
-Homepage = "https://authzx.com"
-Documentation = "https://docs.authzx.com"
-Repository = "https://github.com/authzx/authzx-python"
-Issues = "https://github.com/authzx/authzx-python/issues"
+Homepage = "https://vengtoo.com"
+Documentation = "https://docs.vengtoo.com"
+Repository = "https://github.com/vengtoo/vengtoo-python"
+Issues = "https://github.com/vengtoo/vengtoo-python/issues"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "respx"]
 
 [tool.setuptools.packages.find]
-include = ["authzx*"]
+include = ["vengtoo*"]

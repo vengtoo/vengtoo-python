@@ -1,10 +1,10 @@
-class AuthzXError(Exception):
-    """AuthzX API error with status code."""
+class VengtooError(Exception):
+    """Vengtoo API error with status code."""
 
     def __init__(self, status_code: int, message: str) -> None:
         self.status_code = status_code
         self.message = message
-        super().__init__(f"AuthzX API error (status {status_code}): {message}")
+        super().__init__(f"Vengtoo API error (status {status_code}): {message}")
 
     @property
     def is_auth_error(self) -> bool:
@@ -23,10 +23,10 @@ class AuthzXError(Exception):
         return self.status_code >= 500
 
 
-class AuthzXOAuthError(Exception):
+class VengtooOAuthError(Exception):
     """Raised when the OAuth2 Client Credentials token exchange fails.
 
-    Distinct from ``AuthzXError`` (which wraps API-call failures) so
+    Distinct from ``VengtooError`` (which wraps API-call failures) so
     customers debugging setup know the failure was the OAuth exchange, not
     their ``authorize()`` call.
     """

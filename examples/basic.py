@@ -1,6 +1,6 @@
-from authzx import AuthzX, Subject, Resource, Action, AuthorizeRequest
+from vengtoo import Vengtoo, Subject, Resource, Action, AuthorizeRequest
 
-client = AuthzX(api_key="azx_your_api_key_here")
+client = Vengtoo(api_key="azx_your_api_key_here")
 
 allowed = client.check(
     subject=Subject(id="user-123"),

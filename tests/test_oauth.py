@@ -1,4 +1,4 @@
-"""OAuth2 Client Credentials tests for the AuthzX Python SDK."""
+"""OAuth2 Client Credentials tests for the Vengtoo Python SDK."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from urllib.parse import parse_qs
 import pytest
 
 from authzx import (
-    AuthzX,
-    AuthzXError,
-    AuthzXOAuthError,
+    Vengtoo,
+    VengtooError,
+    VengtooOAuthError,
     Resource,
     Subject,
 )
@@ -103,7 +103,7 @@ def oauth_server():
 
 
 def test_oauth_token_exchange_happy_path(oauth_server):
-    client = AuthzX(
+    client = Vengtoo(
         client_id="cid",
         client_secret="azx_cs_secret",
         base_url=oauth_server["base_url"],
@@ -128,13 +128,13 @@ def test_oauth_invalid_client_clear_error(oauth_server):
     _State.token_status = 401
     _State.token_body = {"error": "invalid_client"}
 
-    client = AuthzX(
+    client = Vengtoo(
         client_id="cid",
         client_secret="azx_cs_wrong",
         base_url=oauth_server["base_url"],
         token_url=oauth_server["token_url"],
     )
-    with pytest.raises(AuthzXOAuthError) as exc_info:
+    with pytest.raises(VengtooOAuthError) as exc_info:
         client.check(
             subject=Subject(id="u-1"),
             action="read",
@@ -146,7 +146,7 @@ def test_oauth_invalid_client_clear_error(oauth_server):
 
 
 def test_oauth_cached_token_reused(oauth_server):
-    client = AuthzX(
+    client = Vengtoo(
         client_id="cid",
         client_secret="azx_cs_secret",
         base_url=oauth_server["base_url"],
@@ -175,7 +175,7 @@ def test_oauth_401_triggers_refresh_and_retry(oauth_server):
 
     _State.api_responder = responder
 
-    client = AuthzX(
+    client = Vengtoo(
         client_id="cid",
         client_secret="azx_cs_secret",
         base_url=oauth_server["base_url"],
@@ -197,13 +197,13 @@ def test_oauth_401_retry_only_once(oauth_server):
 
     _State.api_responder = responder
 
-    client = AuthzX(
+    client = Vengtoo(
         client_id="cid",
         client_secret="azx_cs_secret",
         base_url=oauth_server["base_url"],
         token_url=oauth_server["token_url"],
     )
-    with pytest.raises(AuthzXError) as exc_info:
+    with pytest.raises(VengtooError) as exc_info:
         client.check(
             subject=Subject(id="u-1"),
             action="read",
@@ -216,7 +216,7 @@ def test_oauth_401_retry_only_once(oauth_server):
 
 def test_oauth_apikey_plus_oauth_is_construction_error():
     with pytest.raises(ValueError) as exc_info:
-        AuthzX(
+        Vengtoo(
             api_key="azx_key",
             client_id="cid",
             client_secret="azx_cs_secret",
@@ -226,6 +226,6 @@ def test_oauth_apikey_plus_oauth_is_construction_error():
 
 def test_oauth_partial_credentials_is_construction_error():
     with pytest.raises(ValueError):
-        AuthzX(client_id="cid")  # missing client_secret
+        Vengtoo(client_id="cid")  # missing client_secret
     with pytest.raises(ValueError):
-        AuthzX(client_secret="azx_cs_secret")  # missing client_id
+        Vengtoo(client_secret="azx_cs_secret")  # missing client_id

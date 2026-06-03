@@ -7,35 +7,35 @@ from typing import Any
 
 import httpx
 
-from authzx.errors import AuthzXError, AuthzXOAuthError
-from authzx.types import (
+from vengtoo.errors import VengtooError, VengtooOAuthError
+from vengtoo.types import (
     Action, AuthorizeContext, AuthorizeRequest, AuthorizeResponse,
     BatchEvalItem, BatchEvaluationRequest, BatchEvaluationResponse,
     Resource, Subject,
 )
 
 
-DEFAULT_TOKEN_URL = "https://api.authzx.com/v1/oauth/token"
+DEFAULT_TOKEN_URL = "https://api.vengtoo.com/v1/oauth/token"
 REFRESH_SKEW_SECONDS = 60.0
 
 
-class AuthzX:
-    """AuthzX authorization client.
+class Vengtoo:
+    """Vengtoo authorization client.
 
     For cloud with API key:
-        AuthzX(api_key="azx_...")
+        Vengtoo(api_key="azx_...")
 
     For cloud with OAuth2 Client Credentials:
-        AuthzX(client_id="...", client_secret="azx_cs_...")
+        Vengtoo(client_id="...", client_secret="azx_cs_...")
 
     For local agent:
-        AuthzX(base_url="http://localhost:8181")
+        Vengtoo(base_url="http://localhost:8181")
     """
 
     def __init__(
         self,
         api_key: str = "",
-        base_url: str = "https://api.authzx.com",
+        base_url: str = "https://api.vengtoo.com",
         timeout: float = 10.0,
         max_retries: int = 2,
         client_id: str | None = None,
@@ -54,7 +54,7 @@ class AuthzX:
         if oauth_provided:
             if not client_id or not client_secret:
                 raise ValueError(
-                    "AuthzX: both client_id and client_secret are required for OAuth"
+                    "Vengtoo: both client_id and client_secret are required for OAuth"
                 )
             self._oauth = {
                 "client_id": client_id,
@@ -66,7 +66,7 @@ class AuthzX:
 
         if self.api_key and self._oauth is not None:
             raise ValueError(
-                "AuthzX: configure either api_key or OAuth client credentials, not both"
+                "Vengtoo: configure either api_key or OAuth client credentials, not both"
             )
 
         self._cached_token: str | None = None
@@ -94,13 +94,13 @@ class AuthzX:
             await self._async_client.aclose()
             self._async_client = None
 
-    def __enter__(self) -> AuthzX:
+    def __enter__(self) -> Vengtoo:
         return self
 
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    async def __aenter__(self) -> AuthzX:
+    async def __aenter__(self) -> Vengtoo:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -136,14 +136,14 @@ class AuthzX:
             try:
                 payload = resp.json()
             except Exception as e:  # noqa: BLE001
-                raise AuthzXOAuthError(
+                raise VengtooOAuthError(
                     resp.status_code,
                     "invalid_response",
                     f"token endpoint returned non-JSON body: {e}",
                 )
             access_token = payload.get("access_token")
             if not access_token:
-                raise AuthzXOAuthError(
+                raise VengtooOAuthError(
                     resp.status_code,
                     "invalid_response",
                     "token endpoint returned empty access_token",
@@ -166,7 +166,7 @@ class AuthzX:
             pass
         if resp.status_code == 401 and code == "token_endpoint_error":
             code = "invalid_client"
-        raise AuthzXOAuthError(resp.status_code, code, description)
+        raise VengtooOAuthError(resp.status_code, code, description)
 
     def _fetch_token_sync(self) -> str:
         assert self._oauth is not None
@@ -182,7 +182,7 @@ class AuthzX:
                 headers={"Accept": "application/json"},
             )
         except httpx.HTTPError as e:
-            raise AuthzXOAuthError(
+            raise VengtooOAuthError(
                 0, "network_error", f"OAuth token request failed: {e}"
             )
         return self._parse_token_response(resp)
@@ -216,7 +216,7 @@ class AuthzX:
                 headers={"Accept": "application/json"},
             )
         except httpx.HTTPError as e:
-            raise AuthzXOAuthError(
+            raise VengtooOAuthError(
                 0, "network_error", f"OAuth token request failed: {e}"
             )
         return self._parse_token_response(resp)
@@ -281,13 +281,13 @@ class AuthzX:
                     oauth_retried = True
                     # do not count this against max_retries
                     continue
-                err = AuthzXError(resp.status_code, resp.text)
+                err = VengtooError(resp.status_code, resp.text)
                 if self._is_retryable(resp.status_code):
                     last_err = err
                     attempt += 1
                     continue
                 raise err
-            except (AuthzXError, AuthzXOAuthError):
+            except (VengtooError, VengtooOAuthError):
                 raise
             except Exception as e:
                 last_err = e
@@ -335,13 +335,13 @@ class AuthzX:
                     self._invalidate_token()
                     oauth_retried = True
                     continue
-                err = AuthzXError(resp.status_code, resp.text)
+                err = VengtooError(resp.status_code, resp.text)
                 if self._is_retryable(resp.status_code):
                     last_err = err
                     attempt += 1
                     continue
                 raise err
-            except (AuthzXError, AuthzXOAuthError):
+            except (VengtooError, VengtooOAuthError):
                 raise
             except Exception as e:
                 last_err = e
@@ -384,13 +384,13 @@ class AuthzX:
                     self._invalidate_token()
                     oauth_retried = True
                     continue
-                err = AuthzXError(resp.status_code, resp.text)
+                err = VengtooError(resp.status_code, resp.text)
                 if self._is_retryable(resp.status_code):
                     last_err = err
                     attempt += 1
                     continue
                 raise err
-            except (AuthzXError, AuthzXOAuthError):
+            except (VengtooError, VengtooOAuthError):
                 raise
             except Exception as e:
                 last_err = e
@@ -439,13 +439,13 @@ class AuthzX:
                     self._invalidate_token()
                     oauth_retried = True
                     continue
-                err = AuthzXError(resp.status_code, resp.text)
+                err = VengtooError(resp.status_code, resp.text)
                 if self._is_retryable(resp.status_code):
                     last_err = err
                     attempt += 1
                     continue
                 raise err
-            except (AuthzXError, AuthzXOAuthError):
+            except (VengtooError, VengtooOAuthError):
                 raise
             except Exception as e:
                 last_err = e
@@ -471,7 +471,7 @@ class AuthzX:
 
         Usage:
             @app.get("/documents/{id}")
-            async def get_doc(id: str, _=Depends(authzx.require("document", "read"))):
+            async def get_doc(id: str, _=Depends(vengtoo.require("document", "read"))):
                 ...
         """
         from starlette.requests import Request
