@@ -1,16 +1,16 @@
-from authzx.client import AuthzX
-from authzx.errors import AuthzXError, AuthzXOAuthError
-from authzx.types import (
+from vengtoo.client import Vengtoo
+from vengtoo.errors import VengtooError, VengtooOAuthError
+from vengtoo.types import (
     Action, AuthorizeContext, Subject, Resource, AuthorizeRequest, AuthorizeResponse,
     BatchEvalItem, BatchEvaluationRequest, BatchEvaluationResponse, BatchOptions,
 )
 
-__version__ = "0.4.1"
+__version__ = "1.0.1"
 
 __all__ = [
-    "AuthzX",
-    "AuthzXError",
-    "AuthzXOAuthError",
+    "Vengtoo",
+    "VengtooError",
+    "VengtooOAuthError",
     "Action",
     "AuthorizeContext",
     "Subject",

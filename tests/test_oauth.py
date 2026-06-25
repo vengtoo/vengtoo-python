@@ -9,7 +9,7 @@ from urllib.parse import parse_qs
 
 import pytest
 
-from authzx import (
+from vengtoo import (
     Vengtoo,
     VengtooError,
     VengtooOAuthError,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import httpx
@@ -11,6 +13,7 @@ from vengtoo.errors import VengtooError, VengtooOAuthError
 from vengtoo.types import (
     Action, AuthorizeContext, AuthorizeRequest, AuthorizeResponse,
     BatchEvalItem, BatchEvaluationRequest, BatchEvaluationResponse,
+    CreateDelegationRequest, Delegation,
     Resource, Subject,
 )
 
@@ -246,6 +249,10 @@ class Vengtoo:
                 reason_code=ctx_data.get("reason_code"),
                 policy_id=ctx_data.get("policy_id"),
                 access_path=ctx_data.get("access_path"),
+                auth_req_id=ctx_data.get("auth_req_id"),
+                approval_id=ctx_data.get("approval_id"),
+                expires_in=ctx_data.get("expires_in"),
+                interval=ctx_data.get("interval"),
             )
         return AuthorizeResponse(
             decision=data["decision"],
@@ -355,6 +362,70 @@ class Vengtoo:
         resp = self.authorize_batch(req)
         return [e.decision for e in resp.evaluations]
 
+    def authorize_with_polling(
+        self,
+        req: AuthorizeRequest,
+        timeout: float = 300.0,
+        max_network_errors: int = 3,
+        on_pending: Callable[[str | None, int | None], None] | None = None,
+    ) -> AuthorizeResponse:
+        """Blocking HITL-aware authorize that polls until approved, denied, or timed out.
+
+        Returns an AuthorizeResponse in all cases — never raises for pending/timeout/
+        network errors. Distinct reason_codes:
+          "approval_timeout" — no human responded within timeout seconds
+          "polling_error"    — network errors persisted beyond max_network_errors retries
+        """
+        result = self.authorize(req)
+        if result.decision:
+            return result
+
+        reason_code = result.context.reason_code if result.context else ""
+        if reason_code != "authorization_pending":
+            return result
+
+        if on_pending is not None:
+            auth_req_id = result.context.auth_req_id if result.context else None
+            expires_in = result.context.expires_in if result.context else None
+            on_pending(auth_req_id, expires_in)
+
+        deadline = time.monotonic() + timeout
+        network_errors = 0
+
+        while time.monotonic() < deadline:
+            interval = (result.context.interval if result.context and result.context.interval else 5) + 1
+            time.sleep(interval)
+
+            if time.monotonic() >= deadline:
+                break
+
+            try:
+                result = self.authorize(req)
+                network_errors = 0
+            except Exception:
+                network_errors += 1
+                if network_errors >= max_network_errors:
+                    return AuthorizeResponse(
+                        decision=False,
+                        context=AuthorizeContext(reason_code="polling_error"),
+                    )
+                time.sleep(min(network_errors * 2, 10))
+                continue
+
+            if result.decision:
+                return result
+
+            poll_code = result.context.reason_code if result.context else ""
+            if poll_code == "slow_down":
+                continue
+            if poll_code != "authorization_pending":
+                return result
+
+        return AuthorizeResponse(
+            decision=False,
+            context=AuthorizeContext(reason_code="approval_timeout"),
+        )
+
     # --- Async ---
 
     def _get_async_client(self) -> httpx.AsyncClient:
@@ -459,6 +530,70 @@ class Vengtoo:
         resp = await self.async_authorize_batch(req)
         return [e.decision for e in resp.evaluations]
 
+    async def async_authorize_with_polling(
+        self,
+        req: AuthorizeRequest,
+        timeout: float = 300.0,
+        max_network_errors: int = 3,
+        on_pending: Callable[[str | None, int | None], None] | None = None,
+    ) -> AuthorizeResponse:
+        """Async HITL-aware authorize that polls until approved, denied, or timed out.
+
+        Returns an AuthorizeResponse in all cases — never raises for pending/timeout/
+        network errors. Distinct reason_codes:
+          "approval_timeout" — no human responded within timeout seconds
+          "polling_error"    — network errors persisted beyond max_network_errors retries
+        """
+        result = await self.async_authorize(req)
+        if result.decision:
+            return result
+
+        reason_code = result.context.reason_code if result.context else ""
+        if reason_code != "authorization_pending":
+            return result
+
+        if on_pending is not None:
+            auth_req_id = result.context.auth_req_id if result.context else None
+            expires_in = result.context.expires_in if result.context else None
+            on_pending(auth_req_id, expires_in)
+
+        deadline = time.monotonic() + timeout
+        network_errors = 0
+
+        while time.monotonic() < deadline:
+            interval = (result.context.interval if result.context and result.context.interval else 5) + 1
+            await asyncio.sleep(interval)
+
+            if time.monotonic() >= deadline:
+                break
+
+            try:
+                result = await self.async_authorize(req)
+                network_errors = 0
+            except Exception:
+                network_errors += 1
+                if network_errors >= max_network_errors:
+                    return AuthorizeResponse(
+                        decision=False,
+                        context=AuthorizeContext(reason_code="polling_error"),
+                    )
+                await asyncio.sleep(min(network_errors * 2, 10))
+                continue
+
+            if result.decision:
+                return result
+
+            poll_code = result.context.reason_code if result.context else ""
+            if poll_code == "slow_down":
+                continue
+            if poll_code != "authorization_pending":
+                return result
+
+        return AuthorizeResponse(
+            decision=False,
+            context=AuthorizeContext(reason_code="approval_timeout"),
+        )
+
     # --- FastAPI ---
 
     def require(
@@ -493,3 +628,104 @@ class Vengtoo:
                 raise HTTPException(status_code=403, detail="forbidden")
 
         return dependency
+
+    # --- Delegation ---
+
+    def create_delegation(self, req: CreateDelegationRequest) -> Delegation:
+        """Creates a delegation so that delegate can act on behalf of delegator."""
+        resp = self._client.post(
+            f"{self.base_url}/v1/delegations",
+            json=req.to_dict(),
+            headers=self._headers_sync(),
+        )
+        if resp.status_code != 201:
+            raise VengtooError(resp.status_code, resp.text)
+        data = resp.json()
+        return Delegation(
+            id=data["id"],
+            delegate_id=data["delegate_id"],
+            delegator_id=data["delegator_id"],
+            created_at=data["created_at"],
+            expires_at=data.get("expires_at"),
+            revoked_at=data.get("revoked_at"),
+        )
+
+    def revoke_delegation(self, delegation_id: str) -> None:
+        """Revokes an active delegation. The delegate immediately loses access."""
+        resp = self._client.delete(
+            f"{self.base_url}/v1/delegations/{delegation_id}",
+            headers=self._headers_sync(),
+        )
+        if resp.status_code != 200:
+            raise VengtooError(resp.status_code, resp.text)
+
+    @contextlib.contextmanager
+    def with_delegation(self, req: CreateDelegationRequest) -> Iterator[Delegation]:
+        """Context manager that creates a delegation on enter and revokes it on exit.
+
+        Guarantees the delegate never retains access beyond the task boundary,
+        even if the body raises an exception.
+
+        Example::
+
+            with vengtoo.with_delegation(
+                CreateDelegationRequest(delegator_id=john_id, delegate_id=agent_id)
+            ) as delegation:
+                run_workflow()
+        """
+        delegation = self.create_delegation(req)
+        try:
+            yield delegation
+        finally:
+            try:
+                self.revoke_delegation(delegation.id)
+            except Exception:
+                pass
+
+    async def async_create_delegation(self, req: CreateDelegationRequest) -> Delegation:
+        """Async variant of create_delegation."""
+        resp = await self._get_async_client().post(
+            f"{self.base_url}/v1/delegations",
+            json=req.to_dict(),
+            headers=await self._headers_async(),
+        )
+        if resp.status_code != 201:
+            raise VengtooError(resp.status_code, resp.text)
+        data = resp.json()
+        return Delegation(
+            id=data["id"],
+            delegate_id=data["delegate_id"],
+            delegator_id=data["delegator_id"],
+            created_at=data["created_at"],
+            expires_at=data.get("expires_at"),
+            revoked_at=data.get("revoked_at"),
+        )
+
+    async def async_revoke_delegation(self, delegation_id: str) -> None:
+        """Async variant of revoke_delegation."""
+        resp = await self._get_async_client().delete(
+            f"{self.base_url}/v1/delegations/{delegation_id}",
+            headers=await self._headers_async(),
+        )
+        if resp.status_code != 200:
+            raise VengtooError(resp.status_code, resp.text)
+
+    @contextlib.asynccontextmanager
+    async def async_with_delegation(self, req: CreateDelegationRequest) -> AsyncIterator[Delegation]:
+        """Async context manager variant of with_delegation.
+
+        Example::
+
+            async with vengtoo.async_with_delegation(
+                CreateDelegationRequest(delegator_id=john_id, delegate_id=agent_id)
+            ) as delegation:
+                await run_workflow()
+        """
+        delegation = await self.async_create_delegation(req)
+        try:
+            yield delegation
+        finally:
+            try:
+                await self.async_revoke_delegation(delegation.id)
+            except Exception:
+                pass

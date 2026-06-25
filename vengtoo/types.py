@@ -4,38 +4,41 @@ from typing import Any
 
 @dataclass
 class Subject:
-    id: str
-    type: str | None = None
-    attributes: dict[str, Any] | None = None
+    type: str
+    id: str | None = None
+    external_id: str | None = None
     properties: dict[str, Any] | None = None
-    roles: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"id": self.id}
+        d: dict[str, Any] = {}
+        if self.id:
+            d["id"] = self.id
+        if self.external_id:
+            d["external_id"] = self.external_id
         if self.type:
             d["type"] = self.type
-        if self.attributes:
-            d["attributes"] = self.attributes
         if self.properties:
             d["properties"] = self.properties
-        if self.roles:
-            d["roles"] = self.roles
         return d
 
 
 @dataclass
 class Resource:
-    id: str
-    type: str | None = None
-    attributes: dict[str, Any] | None = None
+    type: str
+    id: str | None = None
+    external_id: str | None = None
     properties: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"id": self.id}
+        d: dict[str, Any] = {}
+        if self.id:
+            d["id"] = self.id
+        elif not self.external_id:
+            d["id"] = "*"
+        if self.external_id:
+            d["external_id"] = self.external_id
         if self.type:
             d["type"] = self.type
-        if self.attributes:
-            d["attributes"] = self.attributes
         if self.properties:
             d["properties"] = self.properties
         return d
@@ -77,6 +80,11 @@ class AuthorizeContext:
     reason_code: str | None = None
     policy_id: str | None = None
     access_path: str | None = None
+    # HITL fields — present when reason_code is "authorization_pending".
+    auth_req_id: str | None = None
+    approval_id: str | None = None
+    expires_in: int | None = None
+    interval: int | None = None
 
 
 @dataclass
@@ -145,3 +153,29 @@ class BatchEvaluationRequest:
 @dataclass
 class BatchEvaluationResponse:
     evaluations: list[AuthorizeResponse]
+
+
+@dataclass
+class CreateDelegationRequest:
+    delegate_id: str
+    delegator_id: str
+    expires_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "delegate_id": self.delegate_id,
+            "delegator_id": self.delegator_id,
+        }
+        if self.expires_at:
+            d["expires_at"] = self.expires_at
+        return d
+
+
+@dataclass
+class Delegation:
+    id: str
+    delegate_id: str
+    delegator_id: str
+    created_at: str
+    expires_at: str | None = None
+    revoked_at: str | None = None
