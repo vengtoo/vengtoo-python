@@ -28,7 +28,7 @@ class VengtooOAuthError(Exception):
 
     Distinct from ``VengtooError`` (which wraps API-call failures) so
     customers debugging setup know the failure was the OAuth exchange, not
-    their ``authorize()`` call.
+    their ``evaluate()`` call.
     """
 
     def __init__(

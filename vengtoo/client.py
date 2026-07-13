@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -11,15 +12,59 @@ import httpx
 
 from vengtoo.errors import VengtooError, VengtooOAuthError
 from vengtoo.types import (
-    Action, AuthorizeContext, AuthorizeRequest, AuthorizeResponse,
-    BatchEvalItem, BatchEvaluationRequest, BatchEvaluationResponse,
-    CreateDelegationRequest, Delegation,
-    Resource, Subject,
+    Action,
+    BatchEvaluationRequest,
+    BatchEvaluationResponse,
+    CreateDelegationRequest,
+    Delegation,
+    EvaluationContext,
+    EvaluationRequest,
+    EvaluationResponse,
+    Resource,
+    Subject,
 )
-
 
 DEFAULT_TOKEN_URL = "https://api.vengtoo.com/v1/oauth/token"
 REFRESH_SKEW_SECONDS = 60.0
+MAX_RETRY_AFTER_SECONDS = 5.0
+
+
+def _validate_evaluation(req: EvaluationRequest) -> None:
+    """Validates the fields the API requires (AuthZEN 1.0): subject.type,
+    subject.id or external_id, resource.type, action.name. Catching these
+    locally turns a guaranteed server 400 into an immediate, clearer error."""
+    if not req.subject or not req.subject.type:
+        raise ValueError("vengtoo: subject.type is required")
+    if not req.subject.id and not req.subject.external_id:
+        raise ValueError("vengtoo: subject.id or subject.external_id is required")
+    if not req.resource or not req.resource.type:
+        raise ValueError("vengtoo: resource.type is required")
+    if not req.action or not req.action.name:
+        raise ValueError("vengtoo: action.name is required")
+
+
+def _parse_retry_after(value: str | None) -> float:
+    """Parses a Retry-After header in delta-seconds form; garbage yields 0."""
+    if not value:
+        return 0.0
+    try:
+        secs = float(value)
+    except ValueError:
+        return 0.0
+    return secs if secs > 0 else 0.0
+
+
+def _parse_delegation(data: dict[str, Any]) -> Delegation:
+    return Delegation(
+        id=data["id"],
+        delegate_id=data["delegate_id"],
+        delegator_id=data["delegator_id"],
+        created_at=data["created_at"],
+        description=data.get("description"),
+        scope=data.get("scope"),
+        expires_at=data.get("expires_at"),
+        revoked_at=data.get("revoked_at"),
+    )
 
 
 class Vengtoo:
@@ -32,7 +77,7 @@ class Vengtoo:
         Vengtoo(client_id="...", client_secret="azx_cs_...")
 
     For local agent:
-        Vengtoo(base_url="http://localhost:8181")
+        Vengtoo(base_url="http://127.0.0.1:8181")
     """
 
     def __init__(
@@ -240,11 +285,11 @@ class Vengtoo:
             h.update(self._static_auth_header())
         return h
 
-    def _parse_response(self, data: dict[str, Any]) -> AuthorizeResponse:
+    def _parse_response(self, data: dict[str, Any]) -> EvaluationResponse:
         ctx_data = data.get("context")
         ctx = None
         if ctx_data and isinstance(ctx_data, dict):
-            ctx = AuthorizeContext(
+            ctx = EvaluationContext(
                 reason=ctx_data.get("reason"),
                 reason_code=ctx_data.get("reason_code"),
                 policy_id=ctx_data.get("policy_id"),
@@ -254,55 +299,91 @@ class Vengtoo:
                 expires_in=ctx_data.get("expires_in"),
                 interval=ctx_data.get("interval"),
             )
-        return AuthorizeResponse(
-            decision=data["decision"],
-            context=ctx,
-        )
+        return EvaluationResponse(decision=data["decision"], context=ctx)
 
-    def _is_retryable(self, status_code: int) -> bool:
-        return status_code >= 500 or status_code == 429
+    # --- Shared retry engine ---
+    #
+    # One POST with per-attempt timeout, 5xx/429 retry (honoring Retry-After,
+    # capped), and exactly one OAuth refresh+retry on 401.
 
-    # --- Sync ---
-
-    def authorize(self, req: AuthorizeRequest) -> AuthorizeResponse:
-        # OAuth flow gets exactly one 401-triggered refresh+retry across the
-        # whole authorize() call, independent of max_retries.
+    def _post_sync(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         oauth_retried = False
         last_err: Exception | None = None
+        retry_after = 0.0
         attempt = 0
         while attempt <= self.max_retries:
             if attempt > 0:
-                time.sleep(attempt * 0.1)
+                time.sleep(min(max(attempt * 0.1, retry_after), MAX_RETRY_AFTER_SECONDS))
+                retry_after = 0.0
             try:
-                resp = self._client.post(
-                    self._url(), headers=self._headers_sync(), json=req.to_dict()
-                )
+                resp = self._client.post(url, headers=self._headers_sync(), json=payload)
                 if resp.status_code == 200:
-                    return self._parse_response(resp.json())
-                if (
-                    resp.status_code == 401
-                    and self._oauth is not None
-                    and not oauth_retried
-                ):
+                    return resp.json()
+                if resp.status_code == 401 and self._oauth is not None and not oauth_retried:
                     self._invalidate_token()
                     oauth_retried = True
-                    # do not count this against max_retries
-                    continue
+                    continue  # does not count against max_retries
                 err = VengtooError(resp.status_code, resp.text)
-                if self._is_retryable(resp.status_code):
+                if resp.status_code >= 500 or resp.status_code == 429:
                     last_err = err
+                    retry_after = _parse_retry_after(resp.headers.get("retry-after"))
                     attempt += 1
                     continue
                 raise err
             except (VengtooError, VengtooOAuthError):
                 raise
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — network/transport errors are retryable
                 last_err = e
                 attempt += 1
-                continue
-            attempt += 1
         assert last_err is not None
         raise last_err
+
+    async def _post_async(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        client = self._get_async_client()
+        oauth_retried = False
+        last_err: Exception | None = None
+        retry_after = 0.0
+        attempt = 0
+        while attempt <= self.max_retries:
+            if attempt > 0:
+                await asyncio.sleep(min(max(attempt * 0.1, retry_after), MAX_RETRY_AFTER_SECONDS))
+                retry_after = 0.0
+            try:
+                resp = await client.post(url, headers=await self._headers_async(), json=payload)
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code == 401 and self._oauth is not None and not oauth_retried:
+                    self._invalidate_token()
+                    oauth_retried = True
+                    continue
+                err = VengtooError(resp.status_code, resp.text)
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    last_err = err
+                    retry_after = _parse_retry_after(resp.headers.get("retry-after"))
+                    attempt += 1
+                    continue
+                raise err
+            except (VengtooError, VengtooOAuthError):
+                raise
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                attempt += 1
+        assert last_err is not None
+        raise last_err
+
+    @staticmethod
+    def _validate_batch(req: BatchEvaluationRequest) -> None:
+        if not req.evaluations:
+            raise ValueError("vengtoo: batch request requires at least one evaluation")
+        if len(req.evaluations) > 50:
+            raise ValueError("vengtoo: batch request exceeds maximum of 50 evaluations")
+
+    # --- Sync ---
+
+    def evaluate(self, req: EvaluationRequest) -> EvaluationResponse:
+        """Evaluates a single authorization request (AuthZEN 1.0 Access Evaluation)."""
+        _validate_evaluation(req)
+        return self._parse_response(self._post_sync(self._url(), req.to_dict()))
 
     def check(
         self,
@@ -311,72 +392,38 @@ class Vengtoo:
         resource: Resource,
         context: dict[str, Any] | None = None,
     ) -> bool:
-        resp = self.authorize(AuthorizeRequest(subject=subject, resource=resource, action=Action(name=action), context=context))
+        """Convenience: evaluate and return just the boolean decision."""
+        resp = self.evaluate(
+            EvaluationRequest(
+                subject=subject, resource=resource, action=Action(name=action), context=context
+            )
+        )
         return resp.decision
 
-    def authorize_batch(self, req: BatchEvaluationRequest) -> BatchEvaluationResponse:
-        if not req.evaluations:
-            raise ValueError("batch request requires at least one evaluation")
-        if len(req.evaluations) > 50:
-            raise ValueError("batch request exceeds maximum of 50 evaluations")
-        oauth_retried = False
-        last_err: Exception | None = None
-        attempt = 0
-        while attempt <= self.max_retries:
-            if attempt > 0:
-                time.sleep(attempt * 0.1)
-            try:
-                resp = self._client.post(
-                    self._batch_url(), headers=self._headers_sync(), json=req.to_dict()
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return BatchEvaluationResponse(
-                        evaluations=[self._parse_response(e) for e in data["evaluations"]],
-                    )
-                if (
-                    resp.status_code == 401
-                    and self._oauth is not None
-                    and not oauth_retried
-                ):
-                    self._invalidate_token()
-                    oauth_retried = True
-                    continue
-                err = VengtooError(resp.status_code, resp.text)
-                if self._is_retryable(resp.status_code):
-                    last_err = err
-                    attempt += 1
-                    continue
-                raise err
-            except (VengtooError, VengtooOAuthError):
-                raise
-            except Exception as e:
-                last_err = e
-                attempt += 1
-                continue
-            attempt += 1
-        assert last_err is not None
-        raise last_err
+    def evaluate_batch(self, req: BatchEvaluationRequest) -> BatchEvaluationResponse:
+        """Evaluates up to 50 checks in one round-trip (AuthZEN 1.0 batch).
+        Top-level subject/action/resource/context act as defaults items inherit."""
+        self._validate_batch(req)
+        data = self._post_sync(self._batch_url(), req.to_dict())
+        return BatchEvaluationResponse(
+            evaluations=[self._parse_response(e) for e in data["evaluations"]],
+        )
 
-    def check_batch(self, req: BatchEvaluationRequest) -> list[bool]:
-        resp = self.authorize_batch(req)
-        return [e.decision for e in resp.evaluations]
-
-    def authorize_with_polling(
+    def evaluate_with_approval(
         self,
-        req: AuthorizeRequest,
+        req: EvaluationRequest,
         timeout: float = 300.0,
         max_network_errors: int = 3,
         on_pending: Callable[[str | None, int | None], None] | None = None,
-    ) -> AuthorizeResponse:
-        """Blocking HITL-aware authorize that polls until approved, denied, or timed out.
+    ) -> EvaluationResponse:
+        """Blocking HITL-aware evaluate that polls until approved, denied, or timed out.
 
-        Returns an AuthorizeResponse in all cases — never raises for pending/timeout/
+        Returns an EvaluationResponse in all cases — never raises for pending/timeout/
         network errors. Distinct reason_codes:
           "approval_timeout" — no human responded within timeout seconds
           "polling_error"    — network errors persisted beyond max_network_errors retries
         """
-        result = self.authorize(req)
+        result = self.evaluate(req)
         if result.decision:
             return result
 
@@ -385,29 +432,30 @@ class Vengtoo:
             return result
 
         if on_pending is not None:
-            auth_req_id = result.context.auth_req_id if result.context else None
-            expires_in = result.context.expires_in if result.context else None
-            on_pending(auth_req_id, expires_in)
+            on_pending(
+                result.context.auth_req_id if result.context else None,
+                result.context.expires_in if result.context else None,
+            )
 
         deadline = time.monotonic() + timeout
         network_errors = 0
+        # Tracked outside the loop, updated only after successful polls.
+        interval = (result.context.interval if result.context and result.context.interval else 5) + 1
 
         while time.monotonic() < deadline:
-            interval = (result.context.interval if result.context and result.context.interval else 5) + 1
             time.sleep(interval)
-
             if time.monotonic() >= deadline:
                 break
 
             try:
-                result = self.authorize(req)
+                result = self.evaluate(req)
                 network_errors = 0
-            except Exception:
+            except Exception as e:  # noqa: BLE001
                 network_errors += 1
                 if network_errors >= max_network_errors:
-                    return AuthorizeResponse(
+                    return EvaluationResponse(
                         decision=False,
-                        context=AuthorizeContext(reason_code="polling_error"),
+                        context=EvaluationContext(reason_code="polling_error", reason=str(e)),
                     )
                 time.sleep(min(network_errors * 2, 10))
                 continue
@@ -416,14 +464,16 @@ class Vengtoo:
                 return result
 
             poll_code = result.context.reason_code if result.context else ""
+            if result.context and result.context.interval:
+                interval = result.context.interval + 1
             if poll_code == "slow_down":
                 continue
             if poll_code != "authorization_pending":
                 return result
 
-        return AuthorizeResponse(
+        return EvaluationResponse(
             decision=False,
-            context=AuthorizeContext(reason_code="approval_timeout"),
+            context=EvaluationContext(reason_code="approval_timeout"),
         )
 
     # --- Async ---
@@ -433,43 +483,10 @@ class Vengtoo:
             self._async_client = httpx.AsyncClient(timeout=self.timeout)
         return self._async_client
 
-    async def async_authorize(self, req: AuthorizeRequest) -> AuthorizeResponse:
-        client = self._get_async_client()
-        oauth_retried = False
-        last_err: Exception | None = None
-        attempt = 0
-        while attempt <= self.max_retries:
-            if attempt > 0:
-                await asyncio.sleep(attempt * 0.1)
-            try:
-                resp = await client.post(
-                    self._url(), headers=await self._headers_async(), json=req.to_dict()
-                )
-                if resp.status_code == 200:
-                    return self._parse_response(resp.json())
-                if (
-                    resp.status_code == 401
-                    and self._oauth is not None
-                    and not oauth_retried
-                ):
-                    self._invalidate_token()
-                    oauth_retried = True
-                    continue
-                err = VengtooError(resp.status_code, resp.text)
-                if self._is_retryable(resp.status_code):
-                    last_err = err
-                    attempt += 1
-                    continue
-                raise err
-            except (VengtooError, VengtooOAuthError):
-                raise
-            except Exception as e:
-                last_err = e
-                attempt += 1
-                continue
-            attempt += 1
-        assert last_err is not None
-        raise last_err
+    async def async_evaluate(self, req: EvaluationRequest) -> EvaluationResponse:
+        """Async variant of evaluate()."""
+        _validate_evaluation(req)
+        return self._parse_response(await self._post_async(self._url(), req.to_dict()))
 
     async def async_check(
         self,
@@ -478,73 +495,35 @@ class Vengtoo:
         resource: Resource,
         context: dict[str, Any] | None = None,
     ) -> bool:
-        resp = await self.async_authorize(AuthorizeRequest(subject=subject, resource=resource, action=Action(name=action), context=context))
+        """Async variant of check()."""
+        resp = await self.async_evaluate(
+            EvaluationRequest(
+                subject=subject, resource=resource, action=Action(name=action), context=context
+            )
+        )
         return resp.decision
 
-    async def async_authorize_batch(self, req: BatchEvaluationRequest) -> BatchEvaluationResponse:
-        if not req.evaluations:
-            raise ValueError("batch request requires at least one evaluation")
-        if len(req.evaluations) > 50:
-            raise ValueError("batch request exceeds maximum of 50 evaluations")
-        client = self._get_async_client()
-        oauth_retried = False
-        last_err: Exception | None = None
-        attempt = 0
-        while attempt <= self.max_retries:
-            if attempt > 0:
-                await asyncio.sleep(attempt * 0.1)
-            try:
-                resp = await client.post(
-                    self._batch_url(), headers=await self._headers_async(), json=req.to_dict()
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return BatchEvaluationResponse(
-                        evaluations=[self._parse_response(e) for e in data["evaluations"]],
-                    )
-                if (
-                    resp.status_code == 401
-                    and self._oauth is not None
-                    and not oauth_retried
-                ):
-                    self._invalidate_token()
-                    oauth_retried = True
-                    continue
-                err = VengtooError(resp.status_code, resp.text)
-                if self._is_retryable(resp.status_code):
-                    last_err = err
-                    attempt += 1
-                    continue
-                raise err
-            except (VengtooError, VengtooOAuthError):
-                raise
-            except Exception as e:
-                last_err = e
-                attempt += 1
-                continue
-            attempt += 1
-        assert last_err is not None
-        raise last_err
+    async def async_evaluate_batch(self, req: BatchEvaluationRequest) -> BatchEvaluationResponse:
+        """Async variant of evaluate_batch()."""
+        self._validate_batch(req)
+        data = await self._post_async(self._batch_url(), req.to_dict())
+        return BatchEvaluationResponse(
+            evaluations=[self._parse_response(e) for e in data["evaluations"]],
+        )
 
-    async def async_check_batch(self, req: BatchEvaluationRequest) -> list[bool]:
-        resp = await self.async_authorize_batch(req)
-        return [e.decision for e in resp.evaluations]
-
-    async def async_authorize_with_polling(
+    async def async_evaluate_with_approval(
         self,
-        req: AuthorizeRequest,
+        req: EvaluationRequest,
         timeout: float = 300.0,
         max_network_errors: int = 3,
         on_pending: Callable[[str | None, int | None], None] | None = None,
-    ) -> AuthorizeResponse:
-        """Async HITL-aware authorize that polls until approved, denied, or timed out.
+    ) -> EvaluationResponse:
+        """Async HITL-aware evaluate that polls until approved, denied, or timed out.
 
-        Returns an AuthorizeResponse in all cases — never raises for pending/timeout/
-        network errors. Distinct reason_codes:
-          "approval_timeout" — no human responded within timeout seconds
-          "polling_error"    — network errors persisted beyond max_network_errors retries
+        Cancellation follows asyncio semantics: cancelling the task raises
+        CancelledError out of the sleep, as any async caller expects.
         """
-        result = await self.async_authorize(req)
+        result = await self.async_evaluate(req)
         if result.decision:
             return result
 
@@ -553,29 +532,29 @@ class Vengtoo:
             return result
 
         if on_pending is not None:
-            auth_req_id = result.context.auth_req_id if result.context else None
-            expires_in = result.context.expires_in if result.context else None
-            on_pending(auth_req_id, expires_in)
+            on_pending(
+                result.context.auth_req_id if result.context else None,
+                result.context.expires_in if result.context else None,
+            )
 
         deadline = time.monotonic() + timeout
         network_errors = 0
+        interval = (result.context.interval if result.context and result.context.interval else 5) + 1
 
         while time.monotonic() < deadline:
-            interval = (result.context.interval if result.context and result.context.interval else 5) + 1
             await asyncio.sleep(interval)
-
             if time.monotonic() >= deadline:
                 break
 
             try:
-                result = await self.async_authorize(req)
+                result = await self.async_evaluate(req)
                 network_errors = 0
-            except Exception:
+            except Exception as e:  # noqa: BLE001
                 network_errors += 1
                 if network_errors >= max_network_errors:
-                    return AuthorizeResponse(
+                    return EvaluationResponse(
                         decision=False,
-                        context=AuthorizeContext(reason_code="polling_error"),
+                        context=EvaluationContext(reason_code="polling_error", reason=str(e)),
                     )
                 await asyncio.sleep(min(network_errors * 2, 10))
                 continue
@@ -584,14 +563,16 @@ class Vengtoo:
                 return result
 
             poll_code = result.context.reason_code if result.context else ""
+            if result.context and result.context.interval:
+                interval = result.context.interval + 1
             if poll_code == "slow_down":
                 continue
             if poll_code != "authorization_pending":
                 return result
 
-        return AuthorizeResponse(
+        return EvaluationResponse(
             decision=False,
-            context=AuthorizeContext(reason_code="approval_timeout"),
+            context=EvaluationContext(reason_code="approval_timeout"),
         )
 
     # --- FastAPI ---
@@ -600,31 +581,52 @@ class Vengtoo:
         self,
         resource_type: str,
         action: str,
-        subject_header: str = "x-user-id",
+        subject: Callable[[Any], Subject | Any],
     ):
-        """FastAPI dependency that enforces authorization.
+        """FastAPI dependency that enforces authorization — the coarse,
+        route-level layer. For per-object decisions, call check()/evaluate()
+        inside the handler where the resource is known.
 
-        Usage:
+        ``subject`` resolves the authenticated caller from the request — the
+        hand-off point between your authentication layer and this dependency.
+        It may be sync or async, and may itself raise HTTPException. Returning
+        a Subject with neither id nor external_id (or raising) rejects with 401.
+
+        Usage::
+
+            def current_subject(request: Request) -> Subject:
+                user = getattr(request.state, "user", None)  # set by authn middleware
+                if user is None:
+                    raise HTTPException(status_code=401, detail="unauthenticated")
+                return Subject(id=user.id, type="user")
+
             @app.get("/documents/{id}")
-            async def get_doc(id: str, _=Depends(vengtoo.require("document", "read"))):
+            async def get_doc(id: str, _=Depends(vengtoo.require("document", "read", current_subject))):
                 ...
         """
+        from starlette.exceptions import HTTPException
         from starlette.requests import Request
 
         async def dependency(request: Request) -> None:
-            subject_id = request.headers.get(subject_header, "")
-            if not subject_id:
-                from starlette.exceptions import HTTPException
-                raise HTTPException(status_code=401, detail="missing subject ID")
+            try:
+                sub = subject(request)
+                if inspect.isawaitable(sub):
+                    sub = await sub
+            except HTTPException:
+                raise
+            except Exception:  # noqa: BLE001 — extractor failure = unauthenticated
+                raise HTTPException(status_code=401, detail="unauthenticated")
+            if not isinstance(sub, Subject) or (not sub.id and not sub.external_id):
+                raise HTTPException(status_code=401, detail="unauthenticated")
 
             resource_id = request.path_params.get("id", request.url.path)
-            allowed = await self.async_check(
-                Subject(id=subject_id, type="user"),
-                action,
-                Resource(id=resource_id, type=resource_type),
-            )
+            try:
+                allowed = await self.async_check(
+                    sub, action, Resource(id=resource_id, type=resource_type)
+                )
+            except Exception:  # noqa: BLE001 — fail closed on infrastructure errors
+                raise HTTPException(status_code=500, detail="authorization check failed")
             if not allowed:
-                from starlette.exceptions import HTTPException
                 raise HTTPException(status_code=403, detail="forbidden")
 
         return dependency
@@ -640,15 +642,7 @@ class Vengtoo:
         )
         if resp.status_code != 201:
             raise VengtooError(resp.status_code, resp.text)
-        data = resp.json()
-        return Delegation(
-            id=data["id"],
-            delegate_id=data["delegate_id"],
-            delegator_id=data["delegator_id"],
-            created_at=data["created_at"],
-            expires_at=data.get("expires_at"),
-            revoked_at=data.get("revoked_at"),
-        )
+        return _parse_delegation(resp.json())
 
     def revoke_delegation(self, delegation_id: str) -> None:
         """Revokes an active delegation. The delegate immediately loses access."""
@@ -664,12 +658,17 @@ class Vengtoo:
         """Context manager that creates a delegation on enter and revokes it on exit.
 
         Guarantees the delegate never retains access beyond the task boundary,
-        even if the body raises an exception.
+        even if the body raises. A revocation failure is never swallowed — it
+        raises (chained onto the body's exception if both failed), because a
+        silently-unrevoked delegation means the delegate retains access and
+        the caller must know.
 
         Example::
 
             with vengtoo.with_delegation(
-                CreateDelegationRequest(delegator_id=john_id, delegate_id=agent_id)
+                CreateDelegationRequest(
+                    delegator_id=john_id, delegate_id=agent_id, scope=["invoices:read"]
+                )
             ) as delegation:
                 run_workflow()
         """
@@ -677,10 +676,10 @@ class Vengtoo:
         try:
             yield delegation
         finally:
-            try:
-                self.revoke_delegation(delegation.id)
-            except Exception:
-                pass
+            # Deliberately NOT wrapped in try/except: if this raises during an
+            # in-flight body exception, Python chains them (__context__), so
+            # neither failure is lost.
+            self.revoke_delegation(delegation.id)
 
     async def async_create_delegation(self, req: CreateDelegationRequest) -> Delegation:
         """Async variant of create_delegation."""
@@ -691,15 +690,7 @@ class Vengtoo:
         )
         if resp.status_code != 201:
             raise VengtooError(resp.status_code, resp.text)
-        data = resp.json()
-        return Delegation(
-            id=data["id"],
-            delegate_id=data["delegate_id"],
-            delegator_id=data["delegator_id"],
-            created_at=data["created_at"],
-            expires_at=data.get("expires_at"),
-            revoked_at=data.get("revoked_at"),
-        )
+        return _parse_delegation(resp.json())
 
     async def async_revoke_delegation(self, delegation_id: str) -> None:
         """Async variant of revoke_delegation."""
@@ -711,7 +702,9 @@ class Vengtoo:
             raise VengtooError(resp.status_code, resp.text)
 
     @contextlib.asynccontextmanager
-    async def async_with_delegation(self, req: CreateDelegationRequest) -> AsyncIterator[Delegation]:
+    async def async_with_delegation(
+        self, req: CreateDelegationRequest
+    ) -> AsyncIterator[Delegation]:
         """Async context manager variant of with_delegation.
 
         Example::
@@ -725,7 +718,5 @@ class Vengtoo:
         try:
             yield delegation
         finally:
-            try:
-                await self.async_revoke_delegation(delegation.id)
-            except Exception:
-                pass
+            # See with_delegation: revocation failures must surface.
+            await self.async_revoke_delegation(delegation.id)

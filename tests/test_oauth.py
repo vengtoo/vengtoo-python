@@ -110,9 +110,9 @@ def test_oauth_token_exchange_happy_path(oauth_server):
         token_url=oauth_server["token_url"],
     )
     allowed = client.check(
-        subject=Subject(id="u-1"),
+        subject=Subject(type="user", id="u-1"),
         action="read",
-        resource=Resource(id="d-1"),
+        resource=Resource(type="document", id="d-1"),
     )
     assert allowed is True
     assert _State.token_calls == 1
@@ -136,9 +136,9 @@ def test_oauth_invalid_client_clear_error(oauth_server):
     )
     with pytest.raises(VengtooOAuthError) as exc_info:
         client.check(
-            subject=Subject(id="u-1"),
+            subject=Subject(type="user", id="u-1"),
             action="read",
-            resource=Resource(id="d-1"),
+            resource=Resource(type="document", id="d-1"),
         )
     assert "check client_id/client_secret" in str(exc_info.value)
     assert exc_info.value.code == "invalid_client"
@@ -154,9 +154,9 @@ def test_oauth_cached_token_reused(oauth_server):
     )
     for _ in range(3):
         client.check(
-            subject=Subject(id="u-1"),
+            subject=Subject(type="user", id="u-1"),
             action="read",
-            resource=Resource(id="d-1"),
+            resource=Resource(type="document", id="d-1"),
         )
     assert _State.token_calls == 1
     assert _State.api_calls == 3
@@ -182,9 +182,9 @@ def test_oauth_401_triggers_refresh_and_retry(oauth_server):
         token_url=oauth_server["token_url"],
     )
     allowed = client.check(
-        subject=Subject(id="u-1"),
+        subject=Subject(type="user", id="u-1"),
         action="read",
-        resource=Resource(id="d-1"),
+        resource=Resource(type="document", id="d-1"),
     )
     assert allowed is True
     assert _State.token_calls == 2, "expected initial + refresh"
@@ -205,9 +205,9 @@ def test_oauth_401_retry_only_once(oauth_server):
     )
     with pytest.raises(VengtooError) as exc_info:
         client.check(
-            subject=Subject(id="u-1"),
+            subject=Subject(type="user", id="u-1"),
             action="read",
-            resource=Resource(id="d-1"),
+            resource=Resource(type="document", id="d-1"),
         )
     assert exc_info.value.status_code == 401
     # One retry allowed — so 2 API calls total, no infinite loop.

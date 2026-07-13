@@ -1,25 +1,37 @@
 from vengtoo.client import Vengtoo
 from vengtoo.errors import VengtooError, VengtooOAuthError
 from vengtoo.types import (
-    Action, AuthorizeContext, Subject, Resource, AuthorizeRequest, AuthorizeResponse,
-    BatchEvalItem, BatchEvaluationRequest, BatchEvaluationResponse, BatchOptions,
+    Action,
+    BatchEvalItem,
+    BatchEvaluationRequest,
+    BatchEvaluationResponse,
+    BatchOptions,
+    CreateDelegationRequest,
+    Delegation,
+    EvaluationContext,
+    EvaluationRequest,
+    EvaluationResponse,
+    Resource,
+    Subject,
 )
 
-__version__ = "1.0.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "Vengtoo",
     "VengtooError",
     "VengtooOAuthError",
     "Action",
-    "AuthorizeContext",
-    "Subject",
-    "Resource",
-    "AuthorizeRequest",
-    "AuthorizeResponse",
     "BatchEvalItem",
     "BatchEvaluationRequest",
     "BatchEvaluationResponse",
     "BatchOptions",
+    "CreateDelegationRequest",
+    "Delegation",
+    "EvaluationContext",
+    "EvaluationRequest",
+    "EvaluationResponse",
+    "Resource",
+    "Subject",
     "__version__",
 ]

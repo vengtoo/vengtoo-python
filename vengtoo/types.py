@@ -1,4 +1,6 @@
-from dataclasses import dataclass, field
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -34,6 +36,7 @@ class Resource:
         if self.id:
             d["id"] = self.id
         elif not self.external_id:
+            # Type-level check: default id to "*" so type-wide policies evaluate.
             d["id"] = "*"
         if self.external_id:
             d["external_id"] = self.external_id
@@ -57,7 +60,7 @@ class Action:
 
 
 @dataclass
-class AuthorizeRequest:
+class EvaluationRequest:
     subject: Subject
     resource: Resource
     action: Action
@@ -75,7 +78,7 @@ class AuthorizeRequest:
 
 
 @dataclass
-class AuthorizeContext:
+class EvaluationContext:
     reason: str | None = None
     reason_code: str | None = None
     policy_id: str | None = None
@@ -88,9 +91,9 @@ class AuthorizeContext:
 
 
 @dataclass
-class AuthorizeResponse:
+class EvaluationResponse:
     decision: bool
-    context: AuthorizeContext | None = None
+    context: EvaluationContext | None = None
 
 
 @dataclass
@@ -152,13 +155,21 @@ class BatchEvaluationRequest:
 
 @dataclass
 class BatchEvaluationResponse:
-    evaluations: list[AuthorizeResponse]
+    evaluations: list[EvaluationResponse]
 
 
 @dataclass
 class CreateDelegationRequest:
     delegate_id: str
     delegator_id: str
+    #: Free-text label shown in audit and the dashboard.
+    description: str | None = None
+    #: Narrows the delegation to specific permissions of the delegator. Omit
+    #: for the delegator's full scope. The delegate's effective permissions
+    #: are always the intersection of its own policies and the delegator's —
+    #: attenuation, never escalation.
+    scope: list[str] | None = None
+    #: ISO 8601 timestamp at which the delegation automatically expires.
     expires_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -166,6 +177,10 @@ class CreateDelegationRequest:
             "delegate_id": self.delegate_id,
             "delegator_id": self.delegator_id,
         }
+        if self.description:
+            d["description"] = self.description
+        if self.scope:
+            d["scope"] = self.scope
         if self.expires_at:
             d["expires_at"] = self.expires_at
         return d
@@ -177,5 +192,7 @@ class Delegation:
     delegate_id: str
     delegator_id: str
     created_at: str
+    description: str | None = None
+    scope: list[str] | None = None
     expires_at: str | None = None
     revoked_at: str | None = None
