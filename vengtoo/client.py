@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import re
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -21,12 +22,119 @@ from vengtoo.types import (
     EvaluationRequest,
     EvaluationResponse,
     Resource,
+    SearchRequest,
+    SearchResponse,
     Subject,
 )
 
 DEFAULT_TOKEN_URL = "https://api.vengtoo.com/v1/oauth/token"
 REFRESH_SKEW_SECONDS = 60.0
 MAX_RETRY_AFTER_SECONDS = 5.0
+
+# A column identifier must match this before it is placed directly into SQL.
+# Column identifiers are the only thing interpolated into the query text; every
+# comparison value is bound as a parameter.
+_UCAST_COLUMN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+
+# Vengtoo field operator -> SQL comparison. in/nin and regex are special-cased.
+_UCAST_OPERATORS = {
+    "eq": "=",
+    "ne": "!=",
+    "gt": ">",
+    "gte": ">=",
+    "lt": "<",
+    "lte": "<=",
+}
+
+
+def ucast_to_sql(
+    filter: dict, field_map: dict[str, str] | None = None
+) -> tuple[str, list]:
+    """Translate a Vengtoo "UCAST-style" filter tree into a parameterized SQL WHERE clause.
+
+    The tree is the condition tree returned in ``SearchResponse.filter`` by
+    ``search_resource``/``search_subject``/``search_action``. Returns the WHERE
+    text using Postgres-style numbered placeholders (``$1, $2, …``) and the
+    ordered params list, which you bind when running the query against your own
+    database.
+
+    This is a Postgres reference translator: placeholders are ``$N`` and the
+    ``regex`` operator maps to Postgres' ``~``. Other drivers may need a
+    different placeholder style (e.g. ``?``) or regex operator — adapt the two
+    spots noted below if you target another database.
+
+    ``field_map`` maps a filter field name to the real column name; a field
+    absent from the map is used verbatim. Every resulting column identifier is
+    validated against ``^[A-Za-z_][A-Za-z0-9_.]*$`` and rejected with
+    ``ValueError`` otherwise, so a hostile field name cannot inject SQL.
+    Comparison values are ALWAYS bound parameters — never string-interpolated.
+    """
+    params: list = []
+    where = _ucast_build(filter, field_map or {}, params)
+    return where, params
+
+
+def _ucast_column(field: str, field_map: dict[str, str]) -> str:
+    col = field_map.get(field, field)
+    if not isinstance(col, str) or not _UCAST_COLUMN_RE.match(col):
+        raise ValueError(f"ucast_to_sql: invalid column identifier: {col!r}")
+    return col
+
+
+def _ucast_build(node: dict, field_map: dict[str, str], params: list) -> str:
+    if not isinstance(node, dict):
+        raise ValueError("ucast_to_sql: invalid filter node")
+    node_type = node.get("type")
+    if node_type == "const":
+        value = node.get("value")
+        if not isinstance(value, bool):
+            raise ValueError("ucast_to_sql: const node requires a boolean value")
+        return "TRUE" if value else "FALSE"
+    if node_type == "field":
+        return _ucast_field(node, field_map, params)
+    if node_type == "logical":
+        return _ucast_logical(node, field_map, params)
+    raise ValueError(f"ucast_to_sql: unknown filter node type: {node_type!r}")
+
+
+def _ucast_field(node: dict, field_map: dict[str, str], params: list) -> str:
+    col = _ucast_column(node.get("field"), field_map)
+    op = node.get("operator")
+
+    if op in ("in", "nin"):
+        values = node.get("value")
+        if not isinstance(values, (list, tuple)) or len(values) == 0:
+            raise ValueError(f"ucast_to_sql: operator {op} requires a non-empty list value")
+        placeholders = []
+        for v in values:
+            params.append(v)
+            placeholders.append(f"${len(params)}")
+        sql_op = "NOT IN" if op == "nin" else "IN"
+        return f"{col} {sql_op} ({', '.join(placeholders)})"
+
+    if op == "regex":
+        # Postgres regex-match operator. Other drivers may use REGEXP / a function.
+        params.append(node.get("value"))
+        return f"{col} ~ ${len(params)}"
+
+    sql_op = _UCAST_OPERATORS.get(op)
+    if sql_op is None:
+        raise ValueError(f"ucast_to_sql: unknown operator: {op!r}")
+    params.append(node.get("value"))
+    return f"{col} {sql_op} ${len(params)}"
+
+
+def _ucast_logical(node: dict, field_map: dict[str, str], params: list) -> str:
+    op = node.get("operator")
+    conditions = node.get("conditions")
+    if not isinstance(conditions, (list, tuple)) or len(conditions) == 0:
+        raise ValueError(f"ucast_to_sql: logical node {op} requires conditions")
+    if op == "not":
+        return f"NOT ({_ucast_build(conditions[0], field_map, params)})"
+    if op in ("and", "or"):
+        joiner = " AND " if op == "and" else " OR "
+        return joiner.join(f"({_ucast_build(c, field_map, params)})" for c in conditions)
+    raise ValueError(f"ucast_to_sql: unknown logical operator: {op!r}")
 
 
 def _validate_evaluation(req: EvaluationRequest) -> None:
@@ -67,14 +175,40 @@ def _parse_delegation(data: dict[str, Any]) -> Delegation:
     )
 
 
+def verify_policy_decision_point(base_url: str, expected: str, timeout: float = 10.0) -> bool:
+    """Standalone mix-up protection (AuthZEN 1.0 Security Considerations) for
+    callers who don't already have a Vengtoo client instance — e.g. a one-off
+    startup check before constructing one. Client instances should generally
+    prefer the ``verify_policy_decision_point``/``async_verify_policy_decision_point``
+    methods instead, which reuse the client's already-configured base URL and
+    timeout.
+
+    Fetches ``{base_url}/.well-known/authzen-configuration`` and checks that
+    the advertised ``policy_decision_point`` identifier exactly matches
+    ``expected``. Returns ``True`` on an exact match, ``False`` on a clean
+    mismatch or missing field.
+
+    Raises ``VengtooError`` on a non-2xx response, and lets transport or
+    JSON-parse failures (connection error, timeout, invalid JSON) propagate
+    as-is — a request failure is distinguishable from "the PDP identity
+    didn't match."
+    """
+    url = f"{base_url.rstrip('/')}/.well-known/authzen-configuration"
+    resp = httpx.get(url, timeout=timeout)
+    if resp.status_code != 200:
+        raise VengtooError(resp.status_code, resp.text)
+    data = resp.json()
+    return data.get("policy_decision_point") == expected
+
+
 class Vengtoo:
     """Vengtoo authorization client.
 
     For cloud with API key:
-        Vengtoo(api_key="azx_...")
+        Vengtoo(api_key="vgt_...")
 
     For cloud with OAuth2 Client Credentials:
-        Vengtoo(client_id="...", client_secret="azx_cs_...")
+        Vengtoo(client_id="...", client_secret="vgt_cs_...")
 
     For local agent:
         Vengtoo(base_url="http://127.0.0.1:8181")
@@ -159,6 +293,12 @@ class Vengtoo:
 
     def _batch_url(self) -> str:
         return f"{self.base_url}/access/v1/evaluations"
+
+    def _search_url(self, dimension: str) -> str:
+        return f"{self.base_url}/access/v1/search/{dimension}"
+
+    def _discovery_url(self) -> str:
+        return f"{self.base_url}/.well-known/authzen-configuration"
 
     # --- Auth header resolution ---
 
@@ -301,6 +441,22 @@ class Vengtoo:
             )
         return EvaluationResponse(decision=data["decision"], context=ctx)
 
+    def _parse_search_response(self, data: dict[str, Any]) -> SearchResponse:
+        ctx_data = data.get("context")
+        ctx = None
+        if ctx_data and isinstance(ctx_data, dict):
+            ctx = EvaluationContext(
+                reason=ctx_data.get("reason"),
+                reason_code=ctx_data.get("reason_code"),
+                policy_id=ctx_data.get("policy_id"),
+                access_path=ctx_data.get("access_path"),
+            )
+        return SearchResponse(
+            filter=data.get("filter"),
+            results=data.get("results"),
+            context=ctx,
+        )
+
     # --- Shared retry engine ---
     #
     # One POST with per-attempt timeout, 5xx/429 retry (honoring Retry-After,
@@ -400,6 +556,34 @@ class Vengtoo:
         )
         return resp.decision
 
+    def verify_policy_decision_point(self, expected: str) -> bool:
+        """Mix-up protection (AuthZEN 1.0 Security Considerations): confirms this
+        client is actually talking to the PDP it thinks it is, before trusting
+        any decision from it.
+
+        Fetches ``.well-known/authzen-configuration`` and checks that the
+        advertised ``policy_decision_point`` identifier exactly matches
+        ``expected`` (typically the ``base_url`` or PDP identifier this client
+        was configured with). Returns ``True`` on an exact match, ``False`` on
+        a clean mismatch or missing field.
+
+        Raises ``VengtooError`` on a non-2xx response, and lets transport or
+        JSON-parse failures (connection error, timeout, invalid JSON)
+        propagate as-is — a request failure is distinguishable from "the PDP
+        identity didn't match," matching every other method on this client.
+
+        Optional, unauthenticated, and never called automatically — call it
+        once at startup if you want defense in depth against being tricked
+        into trusting a substituted PDP (e.g. via DNS hijack of the discovery
+        lookup). Most relevant in federated / multi-PDP deployments; a single,
+        fixed ``base_url`` already narrows this risk considerably.
+        """
+        resp = self._client.get(self._discovery_url(), timeout=self.timeout)
+        if resp.status_code != 200:
+            raise VengtooError(resp.status_code, resp.text)
+        data = resp.json()
+        return data.get("policy_decision_point") == expected
+
     def evaluate_batch(self, req: BatchEvaluationRequest) -> BatchEvaluationResponse:
         """Evaluates up to 50 checks in one round-trip (AuthZEN 1.0 batch).
         Top-level subject/action/resource/context act as defaults items inherit."""
@@ -407,6 +591,33 @@ class Vengtoo:
         data = self._post_sync(self._batch_url(), req.to_dict())
         return BatchEvaluationResponse(
             evaluations=[self._parse_response(e) for e in data["evaluations"]],
+        )
+
+    def search_resource(self, req: SearchRequest) -> SearchResponse:
+        """Returns the resources a subject may perform an action on (AuthZEN Search).
+
+        Provide the subject and action; ``resource`` is an optional type template
+        (e.g. ``Resource(type="document")``) narrowing the search. The response
+        ``filter`` is a UCAST-style predicate returned as-is (translate it with
+        ``ucast_to_sql``)."""
+        return self._parse_search_response(
+            self._post_sync(self._search_url("resource"), req.to_dict())
+        )
+
+    def search_subject(self, req: SearchRequest) -> SearchResponse:
+        """Returns the subjects that may perform an action on a resource (AuthZEN Search).
+
+        Provide the action and resource; ``subject`` is an optional type template."""
+        return self._parse_search_response(
+            self._post_sync(self._search_url("subject"), req.to_dict())
+        )
+
+    def search_action(self, req: SearchRequest) -> SearchResponse:
+        """Returns the actions a subject may perform on a resource (AuthZEN Search).
+
+        Provide the subject and resource; ``action`` is an optional name template."""
+        return self._parse_search_response(
+            self._post_sync(self._search_url("action"), req.to_dict())
         )
 
     def evaluate_with_approval(
@@ -503,12 +714,39 @@ class Vengtoo:
         )
         return resp.decision
 
+    async def async_verify_policy_decision_point(self, expected: str) -> bool:
+        """Async variant of verify_policy_decision_point()."""
+        client = self._get_async_client()
+        resp = await client.get(self._discovery_url(), timeout=self.timeout)
+        if resp.status_code != 200:
+            raise VengtooError(resp.status_code, resp.text)
+        data = resp.json()
+        return data.get("policy_decision_point") == expected
+
     async def async_evaluate_batch(self, req: BatchEvaluationRequest) -> BatchEvaluationResponse:
         """Async variant of evaluate_batch()."""
         self._validate_batch(req)
         data = await self._post_async(self._batch_url(), req.to_dict())
         return BatchEvaluationResponse(
             evaluations=[self._parse_response(e) for e in data["evaluations"]],
+        )
+
+    async def async_search_resource(self, req: SearchRequest) -> SearchResponse:
+        """Async variant of search_resource()."""
+        return self._parse_search_response(
+            await self._post_async(self._search_url("resource"), req.to_dict())
+        )
+
+    async def async_search_subject(self, req: SearchRequest) -> SearchResponse:
+        """Async variant of search_subject()."""
+        return self._parse_search_response(
+            await self._post_async(self._search_url("subject"), req.to_dict())
+        )
+
+    async def async_search_action(self, req: SearchRequest) -> SearchResponse:
+        """Async variant of search_action()."""
+        return self._parse_search_response(
+            await self._post_async(self._search_url("action"), req.to_dict())
         )
 
     async def async_evaluate_with_approval(

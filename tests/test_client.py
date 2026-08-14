@@ -16,6 +16,7 @@ from vengtoo import (
     Subject,
     Vengtoo,
     VengtooError,
+    verify_policy_decision_point,
 )
 
 ALICE = Subject(id="user-1", type="user")
@@ -58,6 +59,16 @@ class MockHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"{}")
 
+    discovery_data: dict = {"policy_decision_point": "http://placeholder"}
+    discovery_status = 200
+
+    def do_GET(self):
+        MockHandler.call_count += 1
+        self.send_response(MockHandler.discovery_status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(MockHandler.discovery_data).encode())
+
     def log_message(self, format, *args):
         pass
 
@@ -70,6 +81,8 @@ def mock_server():
     MockHandler.extra_headers = {}
     MockHandler.last_body = {}
     MockHandler.responder = None
+    MockHandler.discovery_data = {"policy_decision_point": "http://placeholder"}
+    MockHandler.discovery_status = 200
 
     server = HTTPServer(("127.0.0.1", 0), MockHandler)
     port = server.server_address[1]
@@ -385,3 +398,66 @@ async def test_require_deny_403_and_infra_500(mock_server):
         await dep500(FakeRequest())
     assert ei.value.status_code == 500
     await dead.async_close()
+
+
+# --- mix-up protection (verify_policy_decision_point) ---
+
+
+def test_verify_pdp_match(mock_server):
+    MockHandler.discovery_data = {"policy_decision_point": mock_server}
+    client = Vengtoo(api_key="k", base_url=mock_server)
+    assert client.verify_policy_decision_point(mock_server) is True
+
+
+def test_verify_pdp_mismatch(mock_server):
+    MockHandler.discovery_data = {"policy_decision_point": "https://evil.example.com"}
+    client = Vengtoo(api_key="k", base_url=mock_server)
+    assert client.verify_policy_decision_point(mock_server) is False
+
+
+def test_verify_pdp_missing_field(mock_server):
+    MockHandler.discovery_data = {}
+    client = Vengtoo(api_key="k", base_url=mock_server)
+    assert client.verify_policy_decision_point(mock_server) is False
+
+
+def test_verify_pdp_http_error_raises(mock_server):
+    MockHandler.discovery_status = 500
+    MockHandler.discovery_data = {"error": "boom"}
+    client = Vengtoo(api_key="k", base_url=mock_server)
+    with pytest.raises(VengtooError) as ei:
+        client.verify_policy_decision_point(mock_server)
+    assert ei.value.status_code == 500
+
+
+def test_verify_pdp_connection_error_propagates():
+    # Distinct from a clean mismatch: a request failure must not silently
+    # look like "the PDP identity didn't match."
+    dead = Vengtoo(api_key="k", base_url="http://127.0.0.1:1", max_retries=0)
+    with pytest.raises(Exception):
+        dead.verify_policy_decision_point("http://127.0.0.1:1")
+
+
+def test_verify_pdp_standalone_function(mock_server):
+    # Standalone module-level function — no Vengtoo client instance needed.
+    MockHandler.discovery_data = {"policy_decision_point": mock_server}
+    assert verify_policy_decision_point(mock_server, mock_server) is True
+
+
+@pytest.mark.asyncio
+async def test_async_verify_pdp_match(mock_server):
+    MockHandler.discovery_data = {"policy_decision_point": mock_server}
+    client = Vengtoo(api_key="k", base_url=mock_server)
+    assert await client.async_verify_policy_decision_point(mock_server) is True
+    await client.async_close()
+
+
+@pytest.mark.asyncio
+async def test_async_verify_pdp_http_error_raises(mock_server):
+    MockHandler.discovery_status = 503
+    MockHandler.discovery_data = {"error": "unavailable"}
+    client = Vengtoo(api_key="k", base_url=mock_server)
+    with pytest.raises(VengtooError) as ei:
+        await client.async_verify_policy_decision_point(mock_server)
+    assert ei.value.status_code == 503
+    await client.async_close()

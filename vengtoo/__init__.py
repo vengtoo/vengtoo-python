@@ -1,4 +1,4 @@
-from vengtoo.client import Vengtoo
+from vengtoo.client import Vengtoo, ucast_to_sql, verify_policy_decision_point
 from vengtoo.errors import VengtooError, VengtooOAuthError
 from vengtoo.types import (
     Action,
@@ -12,6 +12,9 @@ from vengtoo.types import (
     EvaluationRequest,
     EvaluationResponse,
     Resource,
+    SearchOptions,
+    SearchRequest,
+    SearchResponse,
     Subject,
 )
 
@@ -32,6 +35,11 @@ __all__ = [
     "EvaluationRequest",
     "EvaluationResponse",
     "Resource",
+    "SearchOptions",
+    "SearchRequest",
+    "SearchResponse",
     "Subject",
+    "ucast_to_sql",
+    "verify_policy_decision_point",
     "__version__",
 ]

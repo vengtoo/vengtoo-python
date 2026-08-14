@@ -1,6 +1,6 @@
 from vengtoo import Action, EvaluationRequest, Resource, Subject, Vengtoo
 
-client = Vengtoo(api_key="azx_your_api_key_here")
+client = Vengtoo(api_key="vgt_your_api_key_here")
 
 allowed = client.check(
     subject=Subject(id="user-123", type="user"),

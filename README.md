@@ -17,7 +17,7 @@ pip install vengtoo
 ```python
 from vengtoo import Vengtoo, Subject, Resource
 
-client = Vengtoo(api_key="azx_...")
+client = Vengtoo(api_key="vgt_...")
 
 allowed = client.check(
     subject=Subject(id="user:123", type="user"),
@@ -28,12 +28,12 @@ allowed = client.check(
 
 ### OAuth2 Client Credentials
 
-For service-to-service auth, pass `client_id` and `client_secret` (secret is prefixed `azx_cs_`). The SDK exchanges credentials at the token endpoint, caches the JWT in memory, refreshes ~60s before expiry, and retries once automatically on a 401. Sync and async calls share the same cache.
+For service-to-service auth, pass `client_id` and `client_secret` (secret is prefixed `vgt_cs_`). The SDK exchanges credentials at the token endpoint, caches the JWT in memory, refreshes ~60s before expiry, and retries once automatically on a 401. Sync and async calls share the same cache.
 
 ```python
 client = Vengtoo(
     client_id="my-client-id",
-    client_secret="azx_cs_...",
+    client_secret="vgt_cs_...",
 )
 ```
 
@@ -43,7 +43,7 @@ Equivalent curl for the underlying token exchange:
 curl -X POST https://api.vengtoo.com/v1/oauth/token \
   -d grant_type=client_credentials \
   -d client_id=my-client-id \
-  -d client_secret=azx_cs_...
+  -d client_secret=vgt_cs_...
 ```
 
 Providing both `api_key` and OAuth credentials is rejected at construction. A bad `client_id` / `client_secret` surfaces as `VengtooOAuthError` (distinct from `VengtooError`) with a message pointing you at the OAuth exchange.
@@ -85,6 +85,43 @@ resp = client.evaluate_batch(BatchEvaluationRequest(
     ],
 ))
 # resp.evaluations[i].decision, positional
+```
+
+### Search (List Filtering)
+
+Instead of checking one resource at a time, ask "which resources can this
+subject act on?" (AuthZEN Search). `search_resource()`, `search_subject()`, and
+`search_action()` search each dimension (each has an `async_` variant). The
+response `filter` is a **UCAST-style filter object** (Vengtoo's own condition
+tree) — returned as received to apply in your own query layer:
+
+```python
+from vengtoo import SearchRequest, SearchOptions
+
+resp = client.search_resource(SearchRequest(
+    subject=Subject(id="alice", type="user"),
+    action=Action(name="read"),
+    resource=Resource(type="document"),   # optional type template
+    options=SearchOptions(return_="filter"),  # "filter" (default) | "results" | "both"
+))
+# resp.filter (UCAST-style tree — apply it in your own query layer),
+# resp.results (present for "results"/"both"), resp.context.reason
+```
+
+#### Translate the filter to SQL
+
+`ucast_to_sql` turns the filter into a parameterized SQL `WHERE` clause you run
+against your own database. It is a Postgres reference translator (`$1, $2, …`
+placeholders, `regex` → `~`); values are always bound parameters, never
+interpolated. Pass a field→column map when your columns differ:
+
+```python
+from vengtoo import ucast_to_sql
+
+resp = client.search_resource(SearchRequest(...))
+where, params = ucast_to_sql(resp.filter, {"owner": "owner_id"})
+# where == "(owner_id = $1) AND (status != $2)"
+rows = db.execute(f"SELECT * FROM documents WHERE {where}", params)
 ```
 
 ### Human-in-the-Loop Approvals
@@ -159,7 +196,7 @@ layer put the caller's identity:
 from fastapi import FastAPI, Depends, HTTPException, Request
 
 app = FastAPI()
-vengtoo = Vengtoo(api_key="azx_...")
+vengtoo = Vengtoo(api_key="vgt_...")
 
 def current_subject(request: Request) -> Subject:
     user = getattr(request.state, "user", None)  # set by your authn middleware
@@ -179,12 +216,24 @@ deny → 403. Authorization infrastructure failure → 500, fail closed.
 
 ```python
 Vengtoo(
-    api_key="azx_...",                  # API key for cloud mode
+    api_key="vgt_...",                  # API key for cloud mode
     base_url="http://127.0.0.1:8181",   # Custom URL (agent mode)
     timeout=5.0,                        # Per-request timeout in seconds (default: 10)
     max_retries=3,                      # Max retries on 5xx/429 (default: 2)
 )
 ```
+
+### Mix-up protection (optional)
+
+```python
+client.verify_policy_decision_point(expected="https://pdp.vengtoo.com")
+# -> True/False. Async: await client.async_verify_policy_decision_point(...)
+```
+
+Confirms the client is actually talking to the PDP it thinks it is, by checking
+the `policy_decision_point` advertised at `.well-known/authzen-configuration`
+against what you expect. Optional, unauthenticated, never called automatically —
+mainly useful as defense in depth in federated / multi-PDP deployments.
 
 ## Error Handling
 

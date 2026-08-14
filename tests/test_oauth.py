@@ -105,7 +105,7 @@ def oauth_server():
 def test_oauth_token_exchange_happy_path(oauth_server):
     client = Vengtoo(
         client_id="cid",
-        client_secret="azx_cs_secret",
+        client_secret="vgt_cs_secret",
         base_url=oauth_server["base_url"],
         token_url=oauth_server["token_url"],
     )
@@ -121,7 +121,7 @@ def test_oauth_token_exchange_happy_path(oauth_server):
     assert _State.last_token_form is not None
     assert _State.last_token_form.get("grant_type") == ["client_credentials"]
     assert _State.last_token_form.get("client_id") == ["cid"]
-    assert _State.last_token_form.get("client_secret") == ["azx_cs_secret"]
+    assert _State.last_token_form.get("client_secret") == ["vgt_cs_secret"]
 
 
 def test_oauth_invalid_client_clear_error(oauth_server):
@@ -130,7 +130,7 @@ def test_oauth_invalid_client_clear_error(oauth_server):
 
     client = Vengtoo(
         client_id="cid",
-        client_secret="azx_cs_wrong",
+        client_secret="vgt_cs_wrong",
         base_url=oauth_server["base_url"],
         token_url=oauth_server["token_url"],
     )
@@ -148,7 +148,7 @@ def test_oauth_invalid_client_clear_error(oauth_server):
 def test_oauth_cached_token_reused(oauth_server):
     client = Vengtoo(
         client_id="cid",
-        client_secret="azx_cs_secret",
+        client_secret="vgt_cs_secret",
         base_url=oauth_server["base_url"],
         token_url=oauth_server["token_url"],
     )
@@ -177,7 +177,7 @@ def test_oauth_401_triggers_refresh_and_retry(oauth_server):
 
     client = Vengtoo(
         client_id="cid",
-        client_secret="azx_cs_secret",
+        client_secret="vgt_cs_secret",
         base_url=oauth_server["base_url"],
         token_url=oauth_server["token_url"],
     )
@@ -199,7 +199,7 @@ def test_oauth_401_retry_only_once(oauth_server):
 
     client = Vengtoo(
         client_id="cid",
-        client_secret="azx_cs_secret",
+        client_secret="vgt_cs_secret",
         base_url=oauth_server["base_url"],
         token_url=oauth_server["token_url"],
     )
@@ -217,9 +217,9 @@ def test_oauth_401_retry_only_once(oauth_server):
 def test_oauth_apikey_plus_oauth_is_construction_error():
     with pytest.raises(ValueError) as exc_info:
         Vengtoo(
-            api_key="azx_key",
+            api_key="vgt_key",
             client_id="cid",
-            client_secret="azx_cs_secret",
+            client_secret="vgt_cs_secret",
         )
     assert "either api_key or OAuth" in str(exc_info.value)
 
@@ -228,4 +228,4 @@ def test_oauth_partial_credentials_is_construction_error():
     with pytest.raises(ValueError):
         Vengtoo(client_id="cid")  # missing client_secret
     with pytest.raises(ValueError):
-        Vengtoo(client_secret="azx_cs_secret")  # missing client_id
+        Vengtoo(client_secret="vgt_cs_secret")  # missing client_id
